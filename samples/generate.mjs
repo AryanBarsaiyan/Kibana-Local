@@ -1,4 +1,4 @@
-// Generates sample log data for manually testing Kibana-Local.
+// Generates sample log data for manually testing KibanaLocal.
 //   node samples/generate.mjs            -> ~16k lines across several files, last 24h
 //   node samples/generate.mjs --big      -> also writes data/big.log (~120 MB) to test initialTailMB
 // Output goes to samples/data/ (git- and vsix-ignored). Re-run any time to refresh timestamps.
@@ -64,7 +64,7 @@ const write = (name, lines) => { fs.writeFileSync(path.join(out, name), lines.jo
       payment: { id: `pay_${hex(12)}`, amount: Math.round(rnd() * 50000) / 100, currency: pick(['USD', 'EUR', 'INR', 'GBP']), provider: pick(['stripe', 'adyen', 'razorpay']), card: { brand: pick(['visa', 'mastercard', 'amex']), last4: String(int(0, 9999)).padStart(4, '0') }, recurring: rnd() < 0.2 },
       customer_id: pick(users),
     };
-    // some shippers prefix JSON with a tag; Kibana-Local should still parse from the first "{"
+    // some shippers prefix JSON with a tag; KibanaLocal should still parse from the first "{"
     lines.push((rnd() < 0.1 ? 'payments | ' : '') + JSON.stringify(rec));
   }
   write('payments.jsonl', lines);

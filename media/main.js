@@ -1,4 +1,4 @@
-// Kibana-Local webview. No inline styles in HTML strings: the CSP has no 'unsafe-inline',
+// KibanaLocal webview. No inline styles in HTML strings: the CSP has no 'unsafe-inline',
 // so every dynamic style is set through the DOM (el.style.*), which CSP permits.
 (function () {
   'use strict';
@@ -48,7 +48,7 @@
         <option value="manual">❚❚ Manual</option>
       </select>
       <button class="btn" id="refreshBtn">Refresh <span class="badge hidden" id="pending" aria-live="polite"></span></button>
-      <button class="btn ghost" id="settingsBtn" aria-label="Kibana-Local settings" aria-expanded="false" aria-controls="setPanel">⚙</button>
+      <button class="btn ghost" id="settingsBtn" aria-label="KibanaLocal settings" aria-expanded="false" aria-controls="setPanel">⚙</button>
     </div>
     <div class="addpanel hidden" id="addPanel" role="group" aria-label="Add index">
       <input id="addName" placeholder="Index name (optional)" class="small" aria-label="Index name">
@@ -57,7 +57,7 @@
       <button class="btn ghost" id="browseFolder">Folder…</button>
       <button class="btn primary" id="addGo">Add</button>
     </div>
-    <div class="setpanel hidden" id="setPanel" role="group" aria-label="Kibana-Local settings">
+    <div class="setpanel hidden" id="setPanel" role="group" aria-label="KibanaLocal settings">
       <div class="setgrid" id="setFields"></div>
       <div class="setusage" id="setUsage" aria-live="polite"></div>
       <div class="setactions">

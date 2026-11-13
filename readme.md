@@ -1,8 +1,8 @@
-# Kibana-Local
+# KibanaLocal
 
 Kibana-style Discover view for local **JSON-lines (LDJSON / NDJSON / JSONL)** log files, right inside VS Code.
 
-> Kibana-Local is an independent project. It is not affiliated with, endorsed by, or sponsored by Elastic N.V. or Elasticsearch B.V. Kibana and Elasticsearch are trademarks of Elasticsearch B.V.
+> KibanaLocal is an independent project. It is not affiliated with, endorsed by, or sponsored by Elastic N.V. or Elasticsearch B.V. Kibana and Elasticsearch are trademarks of Elasticsearch B.V.
 
 ## Features
 - **Indexes**: add a log file, or a folder (every `.log/.jsonl/.ndjson/.ldjson/.json/.txt/.out` inside becomes part of that index). Query one, several (Ctrl/Cmd-click), or all.
@@ -24,7 +24,7 @@ Kibana-style Discover view for local **JSON-lines (LDJSON / NDJSON / JSONL)** lo
 `/` focus search · `↑/↓` `PgUp/PgDn` `Home/End` move through results · `Enter` expand/collapse · `Tab` reaches every control.
 
 ## Usage
-Click the **Kibana-Local** icon in the Activity Bar, or Command Palette → **Kibana-Local: Open**, then **+ Index** and paste a path. Or right-click a log file/folder → **Open in Kibana-Local**. Press `/` to focus search.
+Click the **KibanaLocal** icon in the Activity Bar, or Command Palette → **KibanaLocal: Open**, then **+ Index** and paste a path. Or right-click a log file/folder → **Open in KibanaLocal**. Press `/` to focus search.
 
 ## Settings
 | Setting | Default | |

@@ -116,7 +116,7 @@ export class LogScopePanel {
     };
     this.ui.indexes = this.ui.indexes.filter((n) => this.sources.some((s) => s.name === n));
 
-    this.panel = vscode.window.createWebviewPanel('logscope', 'Kibana-Local', vscode.ViewColumn.Active, {
+    this.panel = vscode.window.createWebviewPanel('logscope', 'KibanaLocal', vscode.ViewColumn.Active, {
       enableScripts: true,
       retainContextWhenHidden: true,
       localResourceRoots: [vscode.Uri.joinPath(ctx.extensionUri, 'media')],
@@ -146,7 +146,7 @@ export class LogScopePanel {
     try {
       kind = fs.statSync(p).isDirectory() ? 'folder' : 'file';
     } catch {
-      void vscode.window.showErrorMessage(`Kibana-Local: path not found: ${p}`);
+      void vscode.window.showErrorMessage(`KibanaLocal: path not found: ${p}`);
       return;
     }
     const existing = this.sources.find((s) => path.resolve(s.path) === path.resolve(p));
@@ -384,7 +384,7 @@ export class LogScopePanel {
         break;
       case 'copy':
         await vscode.env.clipboard.writeText(String(m.text ?? ''));
-        vscode.window.setStatusBarMessage('Kibana-Local: copied', 1500);
+        vscode.window.setStatusBarMessage('KibanaLocal: copied', 1500);
         break;
       case 'openSettings':
         void vscode.commands.executeCommand('workbench.action.openSettings', 'logscope');
@@ -416,7 +416,7 @@ export class LogScopePanel {
     return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${w.cspSource}; style-src ${w.cspSource}; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link rel="stylesheet" href="${css}"><title>Kibana-Local</title></head>
+<link rel="stylesheet" href="${css}"><title>KibanaLocal</title></head>
 <body><div id="app"></div><script nonce="${nonce}" src="${js}"></script></body></html>`;
   }
 

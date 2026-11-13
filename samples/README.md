@@ -1,4 +1,4 @@
-# Sample logs for testing Kibana-Local
+# Sample logs for testing KibanaLocal
 
 ```sh
 npm run samples          # writes samples/data/ (~17k lines, last 24h, error spike ~3h ago)

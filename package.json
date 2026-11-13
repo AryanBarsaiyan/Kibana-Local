@@ -1,8 +1,8 @@
 {
-  "name": "Kibana-Local",
-  "displayName": "Kibana-Local",
+  "name": "kibanalocal",
+  "displayName": "KibanaLocal",
   "description": "Kibana-style search, histogram and field explorer for local JSON-lines (LDJSON/NDJSON) log files, with live tailing.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "AryanBarsaiyan",
   "author": {
     "name": "Aryan Barsaiyan"
@@ -34,57 +34,57 @@
       {
         "command": "logscope.open",
         "title": "Open",
-        "category": "Kibana-Local",
+        "category": "KibanaLocal",
         "icon": "$(go-to-file)"
       },
       {
         "command": "logscope.addFile",
         "title": "Add Log File as Index",
-        "category": "Kibana-Local",
+        "category": "KibanaLocal",
         "icon": "$(new-file)"
       },
       {
         "command": "logscope.addFolder",
         "title": "Add Log Folder as Index",
-        "category": "Kibana-Local",
+        "category": "KibanaLocal",
         "icon": "$(new-folder)"
       },
       {
         "command": "logscope.openWith",
-        "title": "Open in Kibana-Local",
-        "category": "Kibana-Local"
+        "title": "Open in KibanaLocal",
+        "category": "KibanaLocal"
       },
       {
         "command": "logscope.showIndex",
         "title": "Open Index",
-        "category": "Kibana-Local"
+        "category": "KibanaLocal"
       },
       {
         "command": "logscope.removeIndex",
         "title": "Remove Index",
-        "category": "Kibana-Local",
+        "category": "KibanaLocal",
         "icon": "$(trash)"
       },
       {
         "command": "logscope.reloadIndex",
         "title": "Reload Index",
-        "category": "Kibana-Local",
+        "category": "KibanaLocal",
         "icon": "$(refresh)"
       },
       {
         "command": "logscope.revealIndex",
         "title": "Reveal in File Explorer",
-        "category": "Kibana-Local"
+        "category": "KibanaLocal"
       },
       {
         "command": "logscope.openIndexFile",
         "title": "Open Log File",
-        "category": "Kibana-Local"
+        "category": "KibanaLocal"
       },
       {
         "command": "logscope.settings",
         "title": "Settings",
-        "category": "Kibana-Local",
+        "category": "KibanaLocal",
         "icon": "$(gear)"
       }
     ],
@@ -92,7 +92,7 @@
       "activitybar": [
         {
           "id": "logscope",
-          "title": "Kibana-Local",
+          "title": "KibanaLocal",
           "icon": "media/activity.svg"
         }
       ]
@@ -109,7 +109,7 @@
     "viewsWelcome": [
       {
         "view": "logscope.indexes",
-        "contents": "No log indexes yet.\n[Open Kibana-Local](command:logscope.open)\n[Add Log File](command:logscope.addFile)\n[Add Log Folder](command:logscope.addFolder)"
+        "contents": "No log indexes yet.\n[Open KibanaLocal](command:logscope.open)\n[Add Log File](command:logscope.addFile)\n[Add Log Folder](command:logscope.addFolder)"
       }
     ],
     "menus": {
@@ -204,7 +204,7 @@
       ]
     },
     "configuration": {
-      "title": "Kibana-Local",
+      "title": "KibanaLocal",
       "properties": {
         "logscope.maxRows": {
           "type": "number",
@@ -273,9 +273,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/AryanBarsaiyan/logscope.git"
+    "url": "https://github.com/AryanBarsaiyan/Kibana-Local.git"
   },
   "bugs": {
-    "url": "https://github.com/AryanBarsaiyan/logscope/issues"
+    "url": "https://github.com/AryanBarsaiyan/Kibana-Local/issues"
   }
 }
