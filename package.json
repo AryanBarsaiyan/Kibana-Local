@@ -1,0 +1,281 @@
+{
+  "name": "Kibana-Local",
+  "displayName": "Kibana-Local",
+  "description": "Kibana-style search, histogram and field explorer for local JSON-lines (LDJSON/NDJSON) log files, with live tailing.",
+  "version": "0.3.0",
+  "publisher": "AryanBarsaiyan",
+  "author": {
+    "name": "Aryan Barsaiyan"
+  },
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "log",
+    "kibana",
+    "json",
+    "ndjson",
+    "jsonl",
+    "ldjson",
+    "tail",
+    "log viewer"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "logscope.open",
+        "title": "Open",
+        "category": "Kibana-Local",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "logscope.addFile",
+        "title": "Add Log File as Index",
+        "category": "Kibana-Local",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "logscope.addFolder",
+        "title": "Add Log Folder as Index",
+        "category": "Kibana-Local",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "logscope.openWith",
+        "title": "Open in Kibana-Local",
+        "category": "Kibana-Local"
+      },
+      {
+        "command": "logscope.showIndex",
+        "title": "Open Index",
+        "category": "Kibana-Local"
+      },
+      {
+        "command": "logscope.removeIndex",
+        "title": "Remove Index",
+        "category": "Kibana-Local",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "logscope.reloadIndex",
+        "title": "Reload Index",
+        "category": "Kibana-Local",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "logscope.revealIndex",
+        "title": "Reveal in File Explorer",
+        "category": "Kibana-Local"
+      },
+      {
+        "command": "logscope.openIndexFile",
+        "title": "Open Log File",
+        "category": "Kibana-Local"
+      },
+      {
+        "command": "logscope.settings",
+        "title": "Settings",
+        "category": "Kibana-Local",
+        "icon": "$(gear)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "logscope",
+          "title": "Kibana-Local",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "logscope": [
+        {
+          "id": "logscope.indexes",
+          "name": "Indexes",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "logscope.indexes",
+        "contents": "No log indexes yet.\n[Open Kibana-Local](command:logscope.open)\n[Add Log File](command:logscope.addFile)\n[Add Log Folder](command:logscope.addFolder)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "logscope.openWith",
+          "when": "explorerResourceIsFolder || resourceExtname =~ /\\.(log|jsonl|ndjson|ldjson|json|txt|out)$/",
+          "group": "navigation@90"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "logscope.openWith",
+          "when": "resourceExtname =~ /\\.(log|jsonl|ndjson|ldjson|txt|out)$/"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "logscope.open",
+          "when": "view == logscope.indexes",
+          "group": "navigation@1"
+        },
+        {
+          "command": "logscope.addFile",
+          "when": "view == logscope.indexes",
+          "group": "navigation@2"
+        },
+        {
+          "command": "logscope.addFolder",
+          "when": "view == logscope.indexes",
+          "group": "navigation@3"
+        },
+        {
+          "command": "logscope.settings",
+          "when": "view == logscope.indexes",
+          "group": "navigation@4"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "logscope.showIndex",
+          "when": "false"
+        },
+        {
+          "command": "logscope.removeIndex",
+          "when": "false"
+        },
+        {
+          "command": "logscope.reloadIndex",
+          "when": "false"
+        },
+        {
+          "command": "logscope.revealIndex",
+          "when": "false"
+        },
+        {
+          "command": "logscope.openIndexFile",
+          "when": "false"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "logscope.reloadIndex",
+          "when": "view == logscope.indexes && viewItem =~ /^logscopeIndex/",
+          "group": "inline@1"
+        },
+        {
+          "command": "logscope.removeIndex",
+          "when": "view == logscope.indexes && viewItem =~ /^logscopeIndex/",
+          "group": "inline@2"
+        },
+        {
+          "command": "logscope.reloadIndex",
+          "when": "view == logscope.indexes && viewItem =~ /^logscopeIndex/",
+          "group": "1_index@1"
+        },
+        {
+          "command": "logscope.openIndexFile",
+          "when": "view == logscope.indexes && viewItem == logscopeIndexFile",
+          "group": "2_file@1"
+        },
+        {
+          "command": "logscope.revealIndex",
+          "when": "view == logscope.indexes && viewItem =~ /^logscopeIndex/",
+          "group": "2_file@2"
+        },
+        {
+          "command": "logscope.removeIndex",
+          "when": "view == logscope.indexes && viewItem =~ /^logscopeIndex/",
+          "group": "9_remove@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Kibana-Local",
+      "properties": {
+        "logscope.maxRows": {
+          "type": "number",
+          "default": 200000,
+          "description": "Maximum log lines kept in memory for each index. Each index keeps its newest lines by timestamp; older lines of that index are dropped."
+        },
+        "logscope.initialTailMB": {
+          "type": "number",
+          "default": 50,
+          "description": "When opening a large file, only the last N MB are loaded initially."
+        },
+        "logscope.refreshIntervalSeconds": {
+          "type": "number",
+          "default": 5,
+          "description": "Interval for the 'Every Ns' refresh mode."
+        },
+        "logscope.timestampField": {
+          "type": "string",
+          "default": "",
+          "description": "Override the auto-detected timestamp field (e.g. \"@timestamp\" or \"meta.ts\")."
+        },
+        "logscope.levelField": {
+          "type": "string",
+          "default": "",
+          "description": "Override the auto-detected level field."
+        },
+        "logscope.messageField": {
+          "type": "string",
+          "default": "",
+          "description": "Override the auto-detected message field."
+        },
+        "logscope.maxMemoryMB": {
+          "type": "number",
+          "default": 512,
+          "minimum": 32,
+          "description": "Approximate memory budget for loaded log lines, shared by all indexes. When over budget, the oldest lines by timestamp are dropped first, from any index."
+        },
+        "logscope.pollIntervalMs": {
+          "type": "number",
+          "default": 2000,
+          "description": "Fallback polling for file changes (covers Docker/NFS/WSL mounts and log rotation). 0 disables."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc -p .",
+    "lint": "eslint .",
+    "test": "tsc -p tsconfig.test.json && node --expose-gc --test \"out-test/test/*.test.js\"",
+    "vscode:prepublish": "npm run typecheck && node esbuild.mjs --production",
+    "package": "vsce package",
+    "samples": "node samples/generate.mjs",
+    "samples:live": "node samples/live.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "~1.80.0",
+    "@vscode/vsce": "^3.9.1",
+    "esbuild": "^0.28.2",
+    "eslint": "^9.39.5",
+    "typescript": "^5.0.0",
+    "typescript-eslint": "^8.36.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AryanBarsaiyan/logscope.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AryanBarsaiyan/logscope/issues"
+  }
+}

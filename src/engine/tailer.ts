@@ -1,0 +1,224 @@
+import * as fs from 'fs';
+import * as path from 'path';
+
+export const LOG_EXT = /\.(log|jsonl|ndjson|ldjson|json|txt|out)$/i;
+const SIG_BYTES = 64;
+
+export interface TailerEvents {
+  onLines(file: string, lines: string[]): void;
+  /** file was truncated in place (e.g. `> app.log`) — previous rows are gone */
+  onTruncate(file: string): void;
+  /** file was replaced by a new one (logrotate rename+create) — previous rows stay as history */
+  onRotate(file: string): void;
+  onError(file: string, err: Error): void;
+}
+
+export interface Tailer {
+  start(): void;
+  /** re-check now; cheap when nothing changed (one stat) */
+  poke(): void;
+  dispose(): void;
+}
+
+/**
+ * Tails one file by byte offset; only new bytes are read.
+ *  - fs.watch gives low-latency change events.
+ *  - poke() is called by a single shared poll timer as a fallback for filesystems
+ *    where fs.watch is unreliable (Docker mounts, NFS, WSL) and to re-attach after rotation.
+ *  - Rotation is detected by inode change; in-place truncation by size shrink OR a
+ *    changed head signature (catches copytruncate where the file regrew past our offset).
+ */
+export class FileTailer implements Tailer {
+  private offset = 0;
+  private partial = '';
+  private ino: number | null = null;
+  private headSig: string | null = null;
+  private skipFirstPartial = false;
+  private stream: fs.ReadStream | null = null;
+  private reading = false;
+  private again = false;
+  private watcher: fs.FSWatcher | null = null;
+  private disposed = false;
+  private missingReported = false;
+
+  constructor(readonly file: string, private ev: TailerEvents, private initialBytes: number) {}
+
+  start() {
+    try {
+      const st = fs.statSync(this.file);
+      this.ino = st.ino || null;
+      if (st.size > this.initialBytes) {
+        this.offset = st.size - this.initialBytes;
+        this.skipFirstPartial = true;
+      }
+    } catch {
+      /* may not exist yet; poke() will pick it up */
+    }
+    this.watch();
+    this.read();
+  }
+
+  private watch() {
+    this.watcher?.close();
+    this.watcher = null;
+    try {
+      this.watcher = fs.watch(this.file, () => this.read());
+      this.watcher.on('error', () => { this.watcher?.close(); this.watcher = null; });
+    } catch {
+      this.watcher = null;
+    }
+  }
+
+  poke() {
+    if (!this.watcher && !this.disposed) this.watch();
+    this.read();
+  }
+
+  private readSig(size: number): string | null {
+    if (size < SIG_BYTES) return null;
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(this.file, 'r');
+      const b = Buffer.alloc(SIG_BYTES);
+      fs.readSync(fd, b, 0, SIG_BYTES, 0);
+      return b.toString('latin1');
+    } catch {
+      return null;
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
+    }
+  }
+
+  private reset() {
+    this.offset = 0;
+    this.partial = '';
+    this.headSig = null;
+    this.skipFirstPartial = false;
+  }
+
+  private read() {
+    if (this.disposed) return;
+    if (this.reading) { this.again = true; return; }
+    this.reading = true;
+    fs.stat(this.file, (err, st) => {
+      if (this.disposed) { this.reading = false; return; }
+      if (err) {
+        if (!this.missingReported && this.ino === null && this.offset === 0) {
+          this.missingReported = true;
+          this.ev.onError(this.file, new Error('file not found yet — waiting for it to be created'));
+        }
+        this.finish();
+        return;
+      }
+      this.missingReported = false;
+      const ino = st.ino || null;
+      if (this.ino !== null && ino !== null && ino !== this.ino) {
+        this.ino = ino;
+        this.reset();
+        this.watch(); // old watcher follows the renamed inode
+        this.ev.onRotate(this.file);
+      } else {
+        if (this.ino === null) this.ino = ino;
+        if (st.size < this.offset) {
+          this.reset();
+          this.ev.onTruncate(this.file);
+        } else if (this.headSig !== null && st.size !== this.offset && this.readSig(st.size) !== this.headSig) {
+          this.reset();
+          this.ev.onTruncate(this.file);
+        }
+      }
+      if (st.size === this.offset) { this.finish(); return; }
+      this.readRange(st.size);
+    });
+  }
+
+  private readRange(end: number) {
+    const startedAtZero = this.offset === 0;
+    const stream = fs.createReadStream(this.file, { start: this.offset, end: end - 1, highWaterMark: 1 << 20 });
+    this.stream = stream;
+    // Decode via StringDecoder semantics so multi-byte UTF-8 split across chunks stays intact.
+    stream.setEncoding('utf8');
+    const lines: string[] = [];
+    let buf = this.partial;
+    stream.on('close', () => { if (this.stream === stream) this.stream = null; });
+    stream.on('data', (chunk) => {
+      if (this.disposed) return; // never emit lines after dispose (index removed / reloaded)
+      buf += chunk as string;
+      const parts = buf.split(/\r?\n/);
+      buf = parts.pop() ?? '';
+      if (this.skipFirstPartial && parts.length) { parts.shift(); this.skipFirstPartial = false; }
+      for (const l of parts) if (l.length) lines.push(l);
+      if (lines.length >= 20000) this.ev.onLines(this.file, lines.splice(0));
+    });
+    stream.on('error', (e) => { if (this.disposed) return; this.ev.onError(this.file, e); this.finish(); });
+    stream.on('end', () => {
+      if (this.disposed) { this.reading = false; return; }
+      this.partial = buf;
+      this.offset = end;
+      if (startedAtZero || this.headSig === null) this.headSig = this.readSig(end);
+      if (lines.length) this.ev.onLines(this.file, lines);
+      this.finish();
+    });
+  }
+
+  private finish() {
+    this.reading = false;
+    if (this.again) { this.again = false; this.read(); }
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.watcher?.close();
+    this.watcher = null;
+    this.stream?.destroy();
+    this.stream = null;
+  }
+}
+
+/** Every log-looking file in a folder is tailed as part of one index. */
+export class FolderTailer implements Tailer {
+  private tailers = new Map<string, FileTailer>();
+  private watcher: fs.FSWatcher | null = null;
+  private first = true;
+
+  constructor(readonly dir: string, private ev: TailerEvents, private initialBytes: number) {}
+
+  start() {
+    this.scan();
+    try {
+      this.watcher = fs.watch(this.dir, () => this.scan());
+      this.watcher.on('error', () => { this.watcher?.close(); this.watcher = null; });
+    } catch { /* poll covers it */ }
+  }
+
+  poke() {
+    this.scan();
+    for (const t of this.tailers.values()) t.poke();
+  }
+
+  private scan() {
+    let names: string[];
+    try { names = fs.readdirSync(this.dir); } catch (e) { this.ev.onError(this.dir, e as Error); return; }
+    const seen = new Set<string>();
+    for (const n of names) {
+      if (!LOG_EXT.test(n)) continue;
+      const full = path.join(this.dir, n);
+      try { if (!fs.statSync(full).isFile()) continue; } catch { continue; }
+      seen.add(full);
+      if (!this.tailers.has(full)) {
+        // files that appear after start are read from the beginning
+        const t = new FileTailer(full, this.ev, this.first ? this.initialBytes : Number.MAX_SAFE_INTEGER);
+        this.tailers.set(full, t);
+        t.start();
+      }
+    }
+    this.first = false;
+    for (const [f, t] of this.tailers) if (!seen.has(f)) { t.dispose(); this.tailers.delete(f); }
+  }
+
+  dispose() {
+    this.watcher?.close();
+    for (const t of this.tailers.values()) t.dispose();
+    this.tailers.clear();
+  }
+}
