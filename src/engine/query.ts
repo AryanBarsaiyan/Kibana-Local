@@ -64,11 +64,43 @@ function tokenize(src: string): Tok[] {
 
 const FIELD_RE = /^[A-Za-z_@][\w.@-]*$/;
 
-function escapeRe(s: string) { return s.replace(/[.+?^${}()|[\]\\]/g, '\\$&'); }
-function wildcardRe(v: string, anchored: boolean): RegExp {
-  // "a**b" means the same as "a*b"; collapsing runs keeps the regex from backtracking needlessly
-  const body = v.replace(/\*{2,}/g, '*').split('*').map(escapeRe).join('.*');
-  return new RegExp(anchored ? `^${body}$` : body, 'i');
+function escapeRe(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+/**
+ * Matcher for a `*` wildcard pattern (case-insensitive: callers pass lowercased text). The pieces
+ * between stars are found in order with indexOf, leftmost first, which is always enough for `*`
+ * and costs one pass per piece. A regex like /a.*a.*a.*b/ backtracks with an exponent equal to the
+ * number of stars on a long line that does not match, and a test that runs inside one regex call
+ * cannot be cancelled.
+ */
+export function wildcardMatcher(pattern: string, anchored: boolean): (s: string) => boolean {
+  const parts = pattern.toLowerCase().split('*');
+  if (!anchored) {
+    const pieces = parts.filter(Boolean);
+    return (s) => {
+      let at = 0;
+      for (const p of pieces) {
+        const i = s.indexOf(p, at);
+        if (i < 0) return false;
+        at = i + p.length;
+      }
+      return true;
+    };
+  }
+  // anchored: the first piece is a prefix, the last a suffix, the rest sit in between in order
+  const first = parts[0], last = parts.length > 1 ? parts[parts.length - 1] : '';
+  const mid = parts.slice(1, -1).filter(Boolean);
+  if (parts.length === 1) return (s) => s === first;
+  return (s) => {
+    if (s.length < first.length + last.length || !s.startsWith(first) || !s.endsWith(last)) return false;
+    const end = s.length - last.length;
+    let at = first.length;
+    for (const p of mid) {
+      const i = s.indexOf(p, at);
+      if (i < 0 || i + p.length > end) return false;
+      at = i + p.length;
+    }
+    return true;
+  };
 }
 
 export interface QueryContext { tsFieldOf: (index: string) => string | null }
@@ -119,8 +151,8 @@ function rawMatcher(raw: string, quoted: boolean): ValueMatch {
   if (!quoted && raw === '*') return exists;
   const lower = raw.toLowerCase();
   if (!quoted && raw.includes('*')) {
-    const re = wildcardRe(raw, true);
-    return (v) => v !== undefined && v !== null && re.test(String(v));
+    const m = wildcardMatcher(raw, true);
+    return (v) => v !== undefined && v !== null && m(String(v).toLowerCase());
   }
   if (quoted) return (v) => v !== undefined && v !== null && String(v).toLowerCase().includes(lower);
   const num = Number(raw);
@@ -274,9 +306,9 @@ export function compileQuery(src: string, ctx: QueryContext, collect?: Highlight
     }
     // free text word
     if (w.includes('*')) {
-      const re = wildcardRe(w, false);
+      const m = wildcardMatcher(w, false);
       if (w.replace(/\*/g, '')) hl(null, w, 'wildcard');
-      return (r) => re.test(r.lower);
+      return (r) => m(r.lower);
     }
     const lower = w.toLowerCase();
     hl(null, w, 'phrase');

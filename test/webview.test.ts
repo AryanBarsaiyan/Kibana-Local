@@ -123,3 +123,39 @@ test('filter pills: labels and add-or-update', () => {
   assert.equal(filterText({ field: 'a', op: 'between', gte: '1', negate: false, disabled: false }), 'a ≥ 1');
   assert.equal(filterText({ field: '', op: 'query', query: '', negate: false, disabled: false, label: 'Mine' }), 'Mine');
 });
+
+test('wildcard highlighting is linear and keeps the old regex semantics', () => {
+  const free = (v: string, s: string) => highlight(compileHl([{ field: null, value: v, mode: 'wildcard' }]), s, null);
+  assert.equal(free('gate*', 'a gateway b'), 'a <mark class="hl">gateway</mark> b');
+  assert.equal(free('*way', 'a gateway b'), 'a <mark class="hl">gateway</mark> b');
+  assert.equal(free('g*y', 'gay gateway'), '<mark class="hl">gay</mark> <mark class="hl">gateway</mark>');
+  assert.equal(free('a*b', 'a b'), 'a b', 'stars do not cross whitespace');
+  assert.equal(free('A*B', 'xaXbYbz'), 'x<mark class="hl">aXbYb</mark>z', 'greedy and case-insensitive');
+  const field = compileHl([{ field: 'msg', value: 'g*w*y', mode: 'wildcard' }]);
+  assert.equal(highlight(field, 'Gateway', 'msg'), '<mark class="hl">Gateway</mark>');
+  assert.equal(highlight(field, 'Gateway x', 'msg'), 'Gateway x', 'field wildcards match the whole value');
+
+  // same marks as the regex this replaced, on random input
+  const reEsc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const rnd = (n: number, a: string) => Array.from({ length: n }, () => a[Math.floor(Math.random() * a.length)]).join('');
+  for (let i = 0; i < 3000; i++) {
+    const v = rnd(1 + Math.floor(Math.random() * 5), 'ab*');
+    if (!v.includes('*') || !v.replace(/\*/g, '')) continue;
+    const s = rnd(Math.floor(Math.random() * 12), 'ab ');
+    const re = new RegExp(v.split('*').map(reEsc).join('\\S*'), 'gi');
+    let want = '', at = 0;
+    for (const m of s.matchAll(re)) {
+      if (!m[0].length) continue;
+      want += s.slice(at, m.index) + '<mark class="hl">' + m[0] + '</mark>';
+      at = (m.index ?? 0) + m[0].length;
+    }
+    want += s.slice(at);
+    assert.equal(free(v, s), want, `${v} | ${s}`);
+  }
+
+  const t0 = Date.now();
+  const long = 'a'.repeat(3000);
+  assert.equal(free('a*a*a*a*a*a*a*a*a*a*a*a*b', long), long);
+  assert.equal(highlight(compileHl([{ field: 'm', value: 'a*a*a*a*a*a*a*a*a*a*b', mode: 'wildcard' }]), long, 'm'), long);
+  assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0} ms`);
+});

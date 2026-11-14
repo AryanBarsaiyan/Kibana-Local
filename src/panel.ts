@@ -5,7 +5,7 @@ import * as vscode from 'vscode';
 import { FileTailer, FolderTailer, LOG_EXT, Tailer, TailerEvents } from './engine/tailer';
 import { DetectedFields, Filter, IndexSource, PAGE_SIZE, QueryRequest, QueryResult, SortSpec, StoreLimits } from './engine/types';
 import { WorkerClient } from './engine/workerClient';
-import { cleanColumns, cleanFilters, cleanIndexes, cleanRange, cleanSort, cleanText, clampInt, LIMITS } from './sanitize';
+import { cleanColumns, cleanFilters, cleanIndexes, cleanRange, cleanSort, cleanSources, cleanText, clampInt, LIMITS } from './sanitize';
 
 type Mode = 'live' | 'interval' | 'manual';
 
@@ -26,6 +26,13 @@ const HISTORY_KEY = 'logscope.history';
 const HISTORY_MAX = 20;
 export const INDEX_KEY = 'logscope.indexes';
 const LIVE_DEBOUNCE_MS = 300;
+
+/** The saved index list, re-validated (it may come from an older version or a hand-edited store). */
+export function savedSources(state: vscode.Memento): IndexSource[] {
+  return cleanSources(state.get<unknown>(INDEX_KEY, []));
+}
+
+const expandHome = (p: string) => p.replace(/^~(?=$|[\\/])/, process.env.HOME || process.env.USERPROFILE || '~');
 const RELATIVE_SLIDE_MS = 5000;
 
 /** Settings editable from the in-panel settings form (key -> minimum for numbers, null for strings). */
@@ -91,6 +98,8 @@ export class KibanaLocalPanel {
   /** recent non-empty queries, newest first */
   private history: string[];
   private conf = cfg();
+  /** paths the user picked in the native open dialog from the panel; adding one needs no confirmation */
+  private browsed = new Set<string>();
 
   private ready = false;
   private openSettingsWhenReady = false;
@@ -118,8 +127,8 @@ export class KibanaLocalPanel {
     this.engine = new WorkerClient(path.join(ctx.extensionPath, 'dist', 'worker.js'), this.conf.limits, this.conf.overrides);
     this.engine.onError = (msg) => this.toast(`Engine error: ${msg.split('\n')[0]}`, 'error');
 
-    this.sources = ctx.workspaceState.get<IndexSource[]>(INDEX_KEY, []);
     // persisted state is re-validated too: it may come from an older version or a hand-edited store
+    this.sources = savedSources(ctx.workspaceState);
     const saved = ctx.workspaceState.get<Record<string, unknown>>(STATE_KEY, {}) ?? {};
     this.ui = {
       q: cleanText(saved.q),
@@ -159,6 +168,7 @@ export class KibanaLocalPanel {
   // ---------- sources ----------
 
   addSource(p: string, name?: string) {
+    p = path.resolve(p);
     let kind: 'file' | 'folder';
     try {
       kind = fs.statSync(p).isDirectory() ? 'folder' : 'file';
@@ -214,7 +224,7 @@ export class KibanaLocalPanel {
   /** Remove a saved index when the panel is not open (sidebar). */
   static async removeSaved(ctx: vscode.ExtensionContext, name: string) {
     if (KibanaLocalPanel.current) { KibanaLocalPanel.current.removeSource(name); return; }
-    const sources = ctx.workspaceState.get<IndexSource[]>(INDEX_KEY, []).filter((s) => s.name !== name);
+    const sources = savedSources(ctx.workspaceState).filter((s) => s.name !== name);
     const ui = ctx.workspaceState.get<Partial<UiState>>(STATE_KEY, {});
     if (Array.isArray(ui.indexes)) ui.indexes = ui.indexes.filter((n) => n !== name);
     await ctx.workspaceState.update(STATE_KEY, ui);
@@ -444,18 +454,35 @@ export class KibanaLocalPanel {
         for (const t of this.tailers.values()) t.poke();
         setTimeout(() => this.tick(), 150);
         break;
-      case 'addPath':
-        if (typeof m.path === 'string' && m.path.trim()) {
-          this.addSource(m.path.trim().replace(/^~(?=$|[\\/])/, process.env.HOME || process.env.USERPROFILE || '~'), cleanText(m.name).slice(0, LIMITS.name) || undefined);
+      case 'addPath': {
+        if (typeof m.path !== 'string' || !m.path.trim() || m.path.length > LIMITS.path || m.path.includes('\0')) break;
+        const p = path.resolve(expandHome(m.path.trim()));
+        const name = cleanText(m.name).slice(0, LIMITS.name).trim() || undefined;
+        // Second line of defence against a compromised webview: without a prompt it can only add
+        // what the user picked in the native dialog or an existing index; any other path is
+        // confirmed in a modal outside the webview.
+        if (!this.browsed.has(p) && !this.sources.some((s) => path.resolve(s.path) === p)) {
+          const ok = await vscode.window.showWarningMessage(
+            `Add "${p}" as a KibanaLocal index?`,
+            { modal: true, detail: 'KibanaLocal will read this file (or every log file in this folder) and keep following it.' },
+            'Add Index',
+          );
+          if (ok !== 'Add Index') break;
         }
+        this.browsed.delete(p);
+        this.addSource(p, name);
         break;
+      }
       case 'browse': {
         const folder = m.kind === 'folder';
         const uris = await vscode.window.showOpenDialog({
           canSelectFiles: !folder, canSelectFolders: folder, canSelectMany: false,
           openLabel: folder ? 'Use folder as index' : 'Use file as index',
         });
-        if (uris?.[0]) this.post({ type: 'browsed', path: uris[0].fsPath });
+        if (uris?.[0]) {
+          this.browsed.add(path.resolve(uris[0].fsPath));
+          this.post({ type: 'browsed', path: uris[0].fsPath });
+        }
         break;
       }
       case 'remove':

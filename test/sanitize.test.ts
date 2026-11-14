@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { clampInt, cleanColumns, cleanFilters, cleanIndexes, cleanRange, cleanSort, cleanText, LIMITS } from '../src/sanitize';
+import * as path from 'path';
+import { clampInt, cleanColumns, cleanFilters, cleanIndexes, cleanRange, cleanSort, cleanSources, cleanText, LIMITS } from '../src/sanitize';
 
 test('cleanFilters drops malformed filters and coerces fields', () => {
   assert.deepEqual(cleanFilters(null), []);
@@ -73,4 +74,20 @@ test('cleanColumns, cleanText, clampInt', () => {
   assert.equal(clampInt('', 0, 10, 7), 7);
   assert.equal(clampInt(NaN, 0, 10, 7), 7);
   assert.equal(clampInt({}, 0, 10, 7), 7);
+});
+
+test('cleanSources keeps only well-formed saved indexes', () => {
+  const abs = path.resolve('logs', 'a.log');
+  const dir = path.resolve('logs');
+  assert.deepEqual(cleanSources(null), []);
+  assert.deepEqual(cleanSources({ name: 'a', path: abs, kind: 'file' }), []);
+  assert.deepEqual(cleanSources([
+    null, 'x', [], { name: 'a', path: abs, kind: 'file', extra: 1 },
+    { name: 'a', path: dir, kind: 'folder' }, // repeated name
+    { name: '', path: abs, kind: 'file' }, { name: 'b', path: 'relative.log', kind: 'file' },
+    { name: 'c', path: abs, kind: 'pipe' }, { name: 'd', path: { toString: 1 }, kind: 'file' },
+    { name: 'e', path: abs + '\0x', kind: 'file' }, { name: 'f'.repeat(LIMITS.name + 1), path: abs, kind: 'file' },
+    { name: 'h', path: 'x'.repeat(LIMITS.path + 1), kind: 'file' },
+    { name: 'g', path: dir, kind: 'folder' },
+  ]), [{ name: 'a', path: abs, kind: 'file' }, { name: 'g', path: dir, kind: 'folder' }]);
 });

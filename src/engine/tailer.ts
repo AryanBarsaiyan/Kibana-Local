@@ -240,7 +240,16 @@ export class FileTailer implements Tailer {
   }
 }
 
-/** Every log-looking file in a folder is tailed as part of one index. */
+/** whether `target` is `dir` or below it (both already resolved with realpath) */
+export function isInside(dir: string, target: string): boolean {
+  const rel = path.relative(dir, target);
+  return rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+}
+
+/**
+ * Every log-looking file in a folder is tailed as part of one index. Symbolic links are followed
+ * only when they point to a file inside the folder.
+ */
 export class FolderTailer implements Tailer {
   private tailers = new Map<string, FileTailer>();
   private watcher: fs.FSWatcher | null = null;
@@ -265,13 +274,19 @@ export class FolderTailer implements Tailer {
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(this.dir, { withFileTypes: true }); } catch (e) { this.ev.onError(this.dir, e as Error); return; }
     const seen = new Set<string>();
+    let realDir: string | null = null;
     for (const d of entries) {
       if (!LOG_EXT.test(d.name)) continue;
       const full = path.join(this.dir, d.name);
       // the directory entry already says regular file vs directory; only links need a stat
       if (!d.isFile()) {
         if (!d.isSymbolicLink()) continue;
-        try { if (!fs.statSync(full).isFile()) continue; } catch { continue; }
+        // follow a link only to a file inside the folder (e.g. current.log -> app-2026-11-14.log),
+        // never out of it: the user chose this folder, not wherever its links point
+        try {
+          realDir ??= fs.realpathSync.native(this.dir);
+          if (!isInside(realDir, fs.realpathSync.native(full)) || !fs.statSync(full).isFile()) continue;
+        } catch { continue; }
       }
       seen.add(full);
       if (!this.tailers.has(full)) {

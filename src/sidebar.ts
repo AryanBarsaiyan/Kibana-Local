@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { IndexSource } from './engine/types';
-import { INDEX_KEY, KibanaLocalPanel } from './panel';
+import { KibanaLocalPanel, savedSources } from './panel';
 
 /** Activity-bar view: lists saved indexes; welcome content shows when there are none. */
 export class IndexesView implements vscode.TreeDataProvider<IndexSource> {
@@ -12,7 +12,7 @@ export class IndexesView implements vscode.TreeDataProvider<IndexSource> {
   }
 
   getChildren(): IndexSource[] {
-    return this.ctx.workspaceState.get<IndexSource[]>(INDEX_KEY, []);
+    return savedSources(this.ctx.workspaceState);
   }
 
   getTreeItem(s: IndexSource): vscode.TreeItem {

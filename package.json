@@ -29,6 +29,12 @@
   ],
   "main": "./dist/extension.js",
   "activationEvents": [],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "KibanaLocal reads and follows log files from disk and is disabled in Restricted Mode."
+    }
+  },
   "contributes": {
     "commands": [
       {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { FileTailer, FolderTailer, TailerEvents, TRUNCATED_MARK } from '../src/engine/tailer';
+import { FileTailer, FolderTailer, isInside, TailerEvents, TRUNCATED_MARK } from '../src/engine/tailer';
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -189,4 +189,32 @@ test('backpressure: reading pauses until onLines settles', async () => {
   assert.equal(batches.reduce((a, b) => a + b, 0), 70_000);
   release();
   t.dispose();
+});
+
+test('folder index follows symlinks inside the folder only', async (tt) => {
+  const { dir, got, ev } = harness();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'logscope-out-'));
+  fs.writeFileSync(path.join(outside, 'secret.log'), '{"from":"outside"}\n');
+  fs.writeFileSync(path.join(dir, 'real.log'), '{"from":"inside"}\n');
+  try {
+    fs.symlinkSync(path.join(outside, 'secret.log'), path.join(dir, 'escape.log'));
+    fs.symlinkSync(path.join(dir, 'real.log'), path.join(dir, 'current.log'));
+  } catch {
+    tt.skip('cannot create symlinks here (Windows without developer mode)');
+    return;
+  }
+  const t = new FolderTailer(dir, ev, 1 << 20);
+  t.start();
+  await settle(t);
+  t.dispose();
+  assert.deepEqual(got.sort(), ['{"from":"inside"}', '{"from":"inside"}']);
+});
+
+test('isInside', () => {
+  const d = path.resolve('base');
+  assert.equal(isInside(d, path.join(d, 'a.log')), true);
+  assert.equal(isInside(d, path.join(d, '..a.log')), true);
+  assert.equal(isInside(d, d), false);
+  assert.equal(isInside(d, path.resolve('other', 'a.log')), false);
+  assert.equal(isInside(d, path.resolve('base-2', 'a.log')), false);
 });

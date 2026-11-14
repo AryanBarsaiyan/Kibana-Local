@@ -3,7 +3,8 @@
  * Webview input is untrusted: these functions accept `unknown` and return only well-formed values.
  * Kept free of `vscode` imports so the tests can run them directly.
  */
-import { Filter, Primitive, SortSpec, TimeRange } from './engine/types';
+import * as path from 'path';
+import { Filter, IndexSource, Primitive, SortSpec, TimeRange } from './engine/types';
 
 export const LIMITS = {
   filters: 100,
@@ -15,6 +16,8 @@ export const LIMITS = {
   text: 10_000,
   /** characters in a field or index name */
   name: 512,
+  /** characters in a file or folder path */
+  path: 4096,
 } as const;
 
 const FILTER_OPS = new Set<Filter['op']>(['is', 'is_one_of', 'between', 'exists', 'query']);
@@ -59,6 +62,26 @@ export function cleanIndexes(x: unknown, known?: readonly string[]): string[] {
     if (typeof n !== 'string' || !n || n.length > LIMITS.name || out.includes(n)) continue;
     if (ok && !ok.has(n)) continue;
     out.push(n);
+  }
+  return out;
+}
+
+/**
+ * Saved index sources (persisted workspace state). Entries need a name, an absolute path and a
+ * known kind; malformed entries and repeated names are dropped.
+ */
+export function cleanSources(x: unknown): IndexSource[] {
+  if (!Array.isArray(x)) return [];
+  const out: IndexSource[] = [];
+  const names = new Set<string>();
+  for (const s of x.slice(0, LIMITS.indexes)) {
+    if (!isObj(s)) continue;
+    const { name, path: p, kind } = s;
+    if (typeof name !== 'string' || !name.trim() || name.length > LIMITS.name || names.has(name)) continue;
+    if (typeof p !== 'string' || !p || p.length > LIMITS.path || p.includes('\0') || !path.isAbsolute(p)) continue;
+    if (kind !== 'file' && kind !== 'folder') continue;
+    names.add(name);
+    out.push({ name, path: p, kind });
   }
   return out;
 }

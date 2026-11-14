@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { flatten, own, parseLine } from '../src/engine/parse';
+import { wildcardMatcher } from '../src/engine/query';
 import { LogStore } from '../src/engine/store';
 import { QueryRequest } from '../src/engine/types';
 
@@ -83,4 +84,34 @@ test('hostile queries return an error instead of throwing', () => {
   }
   // wildcard runs are collapsed and still match
   assert.equal(s.query(all('msg:a**********')).total, 1);
+});
+
+test('wildcards run in linear time: no regex backtracking on long non-matching lines', () => {
+  const s = store();
+  const long = 'a'.repeat(3000);
+  s.ingest('i', '/a.log', [JSON.stringify({ msg: long }), '{"msg": "axbxc"}']);
+  const t0 = Date.now();
+  assert.equal(s.query(all('a*a*a*a*a*a*a*a*a*a*a*a*b')).total, 0);
+  assert.equal(s.query(all('msg:a*a*a*a*a*a*a*a*a*a*a*a*b')).total, 0);
+  assert.equal(s.query(all('msg:(a*a*a*a*a*a*a*a*a*a*b or z*)')).total, 0);
+  assert.ok(Date.now() - t0 < 2000, `took ${Date.now() - t0} ms`);
+  assert.equal(s.query(all('msg:a*b*c')).total, 1);
+  assert.equal(s.query(all('a*x*c')).total, 1);
+});
+
+test('wildcardMatcher agrees with the equivalent regex', () => {
+  const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const rnd = (n: number, a: string) => Array.from({ length: n }, () => a[Math.floor(Math.random() * a.length)]).join('');
+  for (let i = 0; i < 3000; i++) {
+    const pat = rnd(1 + Math.floor(Math.random() * 6), 'ab*');
+    if (!pat.includes('*')) continue;
+    const text = rnd(Math.floor(Math.random() * 8), 'ab');
+    const body = pat.split('*').map(esc).join('[\\s\\S]*');
+    for (const anchored of [true, false]) {
+      const want = new RegExp(anchored ? `^${body}$` : body).test(text);
+      assert.equal(wildcardMatcher(pat, anchored)(text), want, `${pat} ${anchored} ${text}`);
+    }
+  }
+  assert.equal(wildcardMatcher('ABC*', true)('abcdef'), true, 'pattern is lowercased');
+  assert.equal(wildcardMatcher('a*a', true)('a'), false, 'prefix and suffix may not overlap');
 });
