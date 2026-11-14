@@ -10,6 +10,17 @@ export const TRUNCATED_MARK = ' …[line truncated]';
 const BATCH_LINES = 20_000;
 const BATCH_CHARS = 8 << 20;
 
+/**
+ * Poll backoff for idle files of a folder index: after this many polls without growth a file is
+ * polled every 2nd time, then every 4th, then every 8th (16 s at the default 2 s interval).
+ * fs.watch events still read immediately, and any growth resets the file to every poll.
+ */
+const IDLE_STEPS: readonly [idlePolls: number, every: number][] = [[30, 8], [15, 4], [5, 2]];
+export function pollEvery(idlePolls: number): number {
+  for (const [n, every] of IDLE_STEPS) if (idlePolls >= n) return every;
+  return 1;
+}
+
 export interface TailerEvents {
   /**
    * New complete lines. When this returns a promise, the tailer stops reading until it settles
@@ -50,8 +61,16 @@ export class FileTailer implements Tailer {
   private watcher: fs.FSWatcher | null = null;
   private disposed = false;
   private missingReported = false;
+  /** consecutive polls that found the file unchanged */
+  private idlePolls = 0;
+  /** polls still to skip before the next stat (backoff) */
+  private skip = 0;
 
-  constructor(readonly file: string, private ev: TailerEvents, private initialBytes: number, private maxLineChars = MAX_LINE_CHARS) {}
+  /**
+   * @param backoff poll idle files less often (folder indexes, where every file is stat'ed on
+   *   every poll); a single-file index keeps polling every time
+   */
+  constructor(readonly file: string, private ev: TailerEvents, private initialBytes: number, private maxLineChars = MAX_LINE_CHARS, private backoff = false) {}
 
   start() {
     try {
@@ -81,6 +100,7 @@ export class FileTailer implements Tailer {
 
   poke() {
     if (!this.watcher && !this.disposed) this.watch();
+    if (this.skip > 0) { this.skip--; return; }
     this.read();
   }
 
@@ -137,7 +157,13 @@ export class FileTailer implements Tailer {
           this.ev.onTruncate(this.file);
         }
       }
-      if (st.size === this.offset) { this.finish(); return; }
+      if (st.size === this.offset) {
+        if (this.backoff) this.skip = pollEvery(++this.idlePolls) - 1;
+        this.finish();
+        return;
+      }
+      this.idlePolls = 0;
+      this.skip = 0;
       this.readRange(st.size);
     });
   }
@@ -236,17 +262,21 @@ export class FolderTailer implements Tailer {
   }
 
   private scan() {
-    let names: string[];
-    try { names = fs.readdirSync(this.dir); } catch (e) { this.ev.onError(this.dir, e as Error); return; }
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(this.dir, { withFileTypes: true }); } catch (e) { this.ev.onError(this.dir, e as Error); return; }
     const seen = new Set<string>();
-    for (const n of names) {
-      if (!LOG_EXT.test(n)) continue;
-      const full = path.join(this.dir, n);
-      try { if (!fs.statSync(full).isFile()) continue; } catch { continue; }
+    for (const d of entries) {
+      if (!LOG_EXT.test(d.name)) continue;
+      const full = path.join(this.dir, d.name);
+      // the directory entry already says regular file vs directory; only links need a stat
+      if (!d.isFile()) {
+        if (!d.isSymbolicLink()) continue;
+        try { if (!fs.statSync(full).isFile()) continue; } catch { continue; }
+      }
       seen.add(full);
       if (!this.tailers.has(full)) {
         // files that appear after start are read from the beginning
-        const t = new FileTailer(full, this.ev, this.first ? this.initialBytes : Number.MAX_SAFE_INTEGER);
+        const t = new FileTailer(full, this.ev, this.first ? this.initialBytes : Number.MAX_SAFE_INTEGER, MAX_LINE_CHARS, true);
         this.tailers.set(full, t);
         t.start();
       }

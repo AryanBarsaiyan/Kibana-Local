@@ -43,9 +43,17 @@ function safeStringify(v: unknown): string {
   }
 }
 
-/** Own-property lookup on a flattened row: `constructor`, `toString` etc. are not fields. */
+/**
+ * Own-property lookup on a flattened row: `constructor`, `toString`, `__proto__` etc. are not fields.
+ * Field values are always primitives, while everything a plain object inherits from Object.prototype
+ * is a function or an object, so a type check tells them apart. That is about twice as fast as
+ * hasOwnProperty with a dynamic key, and this runs once per row per field predicate.
+ * (Assumes nothing has assigned primitive properties to Object.prototype; setField ensures log
+ * lines never can.)
+ */
 export function own(flat: Record<string, Primitive>, key: string): Primitive | undefined {
-  return Object.prototype.hasOwnProperty.call(flat, key) ? flat[key] : undefined;
+  const v = flat[key];
+  return v === null || (typeof v !== 'object' && typeof v !== 'function') ? v : undefined;
 }
 
 /** Parse a line that may be JSON, or JSON with a non-JSON prefix (e.g. "pod | {...}"). */

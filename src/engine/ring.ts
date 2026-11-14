@@ -46,6 +46,101 @@ export class RowBuffer {
   }
 }
 
+/** (ts, id) ascending; only for rows with a timestamp */
+const byTime = (a: Row, b: Row) => (a.ts as number) - (b.ts as number) || a.id - b.id;
+
+/**
+ * Rows that have a timestamp, sorted by (ts, id), so a time-range query binary-searches its
+ * window instead of visiting every row. Appends in time order (the common case: tailing) are
+ * O(1); out-of-order rows (several files, late lines) wait in a side buffer that is sorted and
+ * merged in on the next read. Removed rows are flagged `dead` by {@link RowBuffer} and skipped;
+ * the array is compacted once they dominate.
+ */
+export class TimeIndex {
+  private a: Row[] = [];
+  private pending: Row[] = [];
+  private deadCount = 0;
+  /** timestamps changed (detection switched fields): rebuilt from the row buffer on next read */
+  private stale = false;
+
+  constructor(private source: RowBuffer) {}
+
+  add(r: Row) {
+    if (r.ts === null || this.stale) return;
+    const last = this.a[this.a.length - 1];
+    if (!this.pending.length && (!last || byTime(last, r) <= 0)) this.a.push(r);
+    else this.pending.push(r);
+  }
+
+  /** a row was removed (already flagged dead) */
+  removed(r: Row) {
+    if (r.ts === null || this.stale) return;
+    if (++this.deadCount > 4096 && this.deadCount * 2 > this.a.length + this.pending.length) {
+      this.a = this.a.filter((x) => !x.dead);
+      this.pending = this.pending.filter((x) => !x.dead);
+      this.deadCount = 0;
+    }
+  }
+
+  /** row timestamps changed or rows were bulk-removed: rebuild lazily */
+  invalidate() {
+    this.stale = true;
+    this.a = [];
+    this.pending = [];
+    this.deadCount = 0;
+  }
+
+  private ready(): Row[] {
+    if (this.stale) {
+      const all: Row[] = [];
+      this.source.forEach((r) => { if (r.ts !== null) all.push(r); });
+      this.a = all.sort(byTime);
+      this.stale = false;
+    } else if (this.pending.length) {
+      const p = this.pending.sort(byTime);
+      this.pending = [];
+      const a = this.a, out = new Array<Row>(a.length + p.length);
+      let i = 0, j = 0, k = 0;
+      while (i < a.length && j < p.length) out[k++] = byTime(a[i], p[j]) <= 0 ? a[i++] : p[j++];
+      while (i < a.length) out[k++] = a[i++];
+      while (j < p.length) out[k++] = p[j++];
+      this.a = out;
+    }
+    return this.a;
+  }
+
+  /** index of the first row with ts >= t (strict: ts > t) */
+  private static bound(a: Row[], t: number, strict: boolean): number {
+    let lo = 0, hi = a.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const ts = a[mid].ts as number;
+      if (strict ? ts <= t : ts < t) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  }
+
+  /** live rows with from <= ts <= to, oldest first */
+  forRange(from: number, to: number, fn: (r: Row) => void) {
+    const a = this.ready();
+    const end = TimeIndex.bound(a, to, true);
+    for (let i = TimeIndex.bound(a, from, false); i < end; i++) {
+      const r = a[i];
+      if (!r.dead) fn(r);
+    }
+  }
+
+  /** live rows with from <= ts <= to, newest first; stops when fn returns false */
+  forRangeNewest(from: number, to: number, fn: (r: Row) => boolean) {
+    const a = this.ready();
+    const start = TimeIndex.bound(a, from, false);
+    for (let i = TimeIndex.bound(a, to, true) - 1; i >= start; i--) {
+      const r = a[i];
+      if (!r.dead && !fn(r)) return;
+    }
+  }
+}
+
 /** Rows of one source file in arrival order (≈ time order within a file). */
 class FileQueue {
   private rows: (Row | undefined)[] = [];

@@ -1,7 +1,8 @@
 import * as path from 'path';
-import { detectFields, flatten, own, parseLine, parseTimestamp } from './parse';
+import { ValueDict } from './dict';
+import { detectFields, flatten, own, parseLine, parseTimestamp, setField } from './parse';
 import { compileFilters, compileQuery, filterHighlights, getField, Pred, QueryContext, QueryError } from './query';
-import { EvictionOrder, RowBuffer } from './ring';
+import { EvictionOrder, RowBuffer, TimeIndex } from './ring';
 import {
   ContextRequest, ContextResult, DetectedFields, FieldStat, Filter, HighlightTerm, Hit, PAGE_SIZE, Primitive, QueryRequest,
   QueryResult, Row, SortSpec, StoreLimits, SuggestRequest, SuggestResult,
@@ -37,25 +38,40 @@ function localMinute(t: number): string {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
-/** Free-text search runs over field values only (like Kibana), not JSON keys/punctuation. */
-function valuesText(flat: Record<string, Primitive>): string {
-  let s = '';
-  for (const v of Object.values(flat)) if (v !== null && v !== undefined) s += String(v).toLowerCase() + '\n';
-  return s;
-}
+/**
+ * Rough retained-heap estimate, calibrated against process.memoryUsage() in test/memory.test.ts.
+ * V8 stores ASCII strings at 1 byte/char plus a header.
+ *   ROW_BYTES   row object, boxed ts/arrival, row-buffer, time-index and eviction-queue slots
+ *   FIELD_BYTES one property of the flattened object
+ *   STR_BYTES   string header (not paid by dictionary-encoded values, which are shared)
+ */
+const ROW_BYTES = 200, FIELD_BYTES = 16, STR_BYTES = 16;
 
 /**
- * Rough retained-heap estimate. V8 stores ASCII strings at 1 byte/char;
- * calibrated against process.memoryUsage() in test/memory.test.ts.
+ * Prepare a parsed row: low-cardinality string values are swapped for their shared dictionary
+ * instance, and the free-text target is built (field values only, like Kibana, not JSON
+ * keys/punctuation; lowercased once here so free-text search never lowercases). Returns the lowercased
+ * text and the estimated bytes of `flat` + `lower`.
  */
-function estimateBytes(raw: string, lower: string, flat: Record<string, Primitive>): number {
-  // fixed per-row cost: row object + buffer slot (160) + arrival field and eviction-queue slot (40, measured)
-  let b = 200 + raw.length + lower.length;
+function encodeRow(flat: Record<string, Primitive>, dict: ValueDict): { lower: string; bytes: number } {
+  const parts: string[] = [];
+  let b = 0;
   for (const k in flat) {
     const v = flat[k];
-    b += 24 + (typeof v === 'string' ? 16 + v.length : 8);
+    b += FIELD_BYTES;
+    if (typeof v === 'string') {
+      const e = dict.lookup(k, v);
+      if (e) { setField(flat, k, e.s); parts.push(e.lower); }
+      else { b += STR_BYTES + v.length; parts.push(v.toLowerCase()); }
+    } else if (v !== null && v !== undefined) {
+      b += 8;
+      parts.push(String(v));
+    }
   }
-  return b;
+  parts.push('');
+  // join() yields a flat string; `s += ...` would build a rope that costs several times more until first searched
+  const lower = parts.join('\n');
+  return { lower, bytes: b + STR_BYTES + lower.length };
 }
 
 /** newest first: by timestamp, then arrival */
@@ -123,13 +139,18 @@ interface Bounds { idxSet: Set<string> | null; from: number; to: number; timed: 
 
 export class LogStore {
   private buf = new RowBuffer();
+  private timeIdx = new TimeIndex(this.buf);
   private order = new EvictionOrder();
+  private dict = new ValueDict();
   private rowsPerIndex = new Map<string, number>();
   private nextId = 1;
   private lastByFile = new Map<string, Row>();
   private indexes = new Map<string, IndexState>();
   /** field names seen per index (capped), for autocomplete */
   private names = new Map<string, Set<string>>();
+  /** bumped whenever a field name is added or removed (invalidates the sorted-names cache) */
+  private namesVersion = 0;
+  private namesCache: { key: string; version: number; list: string[] } | null = null;
   private bytes = 0;
 
   private session: Session | null = null;
@@ -181,6 +202,7 @@ export class LogStore {
     this.buf.forEach((r) => {
       if (r.index === index && r.isJson) r.ts = f ? parseTimestamp(own(r.flat, f)) : null;
     });
+    this.timeIdx.invalidate();
   }
 
   ingest(index: string, filePath: string, lines: string[]) {
@@ -215,11 +237,11 @@ export class LogStore {
         if (n >= DETECT_SAMPLES) st.locked = true;
       }
       const tsf = st.detected.ts;
-      const lower = valuesText(flat);
+      const { lower, bytes } = encodeRow(flat, this.dict);
       const row: Row = {
         id: this.nextId++, index, file, fileKey,
         ts: tsf ? parseTimestamp(own(flat, tsf)) : null,
-        flat, raw: line, lower, isJson: true, bytes: estimateBytes(line, lower, flat), arrival,
+        flat, raw: line, lower, isJson: true, bytes: ROW_BYTES + STR_BYTES + line.length + bytes, arrival,
       };
       this.add(row);
       return;
@@ -245,11 +267,13 @@ export class LogStore {
     const m = LEADING_TS.exec(line);
     const flat: Record<string, Primitive> = { message: line };
     this.noteNames(index, flat);
-    const lower = line.toLowerCase() + '\n';
+    // lowercase after appending, so `lower` is one flat string rather than a two-piece rope
+    const lower = (line + '\n').toLowerCase();
     this.add({
       id: this.nextId++, index, file, fileKey,
       ts: m ? parseTimestamp(m[1]) : null,
-      flat, raw: line, lower, isJson: false, bytes: estimateBytes(line, lower, flat), arrival,
+      // `message` shares the raw string
+      flat, raw: line, lower, isJson: false, bytes: ROW_BYTES + STR_BYTES + line.length + FIELD_BYTES + STR_BYTES + lower.length, arrival,
     });
   }
 
@@ -258,19 +282,25 @@ export class LogStore {
     if (!set) { set = new Set(); this.names.set(index, set); }
     for (const k in flat) {
       if (set.size >= MAX_FIELD_NAMES) return;
-      set.add(k);
+      if (!set.has(k)) { set.add(k); this.namesVersion++; }
     }
   }
 
-  /** field names across the given indexes (all when empty), sorted */
+  /** field names across the given indexes (all when empty), sorted; cached until a name is added */
   fieldNames(indexes: string[] = []): string[] {
+    const key = indexes.join('\u0000');
+    const c = this.namesCache;
+    if (c && c.key === key && c.version === this.namesVersion) return c.list;
     const out = new Set<string>();
     for (const [name, set] of this.names) if (!indexes.length || indexes.includes(name)) for (const k of set) out.add(k);
-    return [...out].sort();
+    const list = [...out].sort();
+    this.namesCache = { key, version: this.namesVersion, list };
+    return list;
   }
 
   private add(row: Row) {
     this.buf.push(row);
+    this.timeIdx.add(row);
     this.order.add(row);
     this.countRow(row.index, 1);
     this.bytes += row.bytes;
@@ -286,6 +316,7 @@ export class LogStore {
     const { maxRows, maxBytes } = this.limits;
     const onEvict = (r: Row) => {
       this.buf.remove(r);
+      this.timeIdx.removed(r);
       this.bytes -= r.bytes;
       this.countRow(r.index, -1);
       this.evicted = true;
@@ -313,6 +344,7 @@ export class LogStore {
     for (const r of this.buf.retain((r) => r.fileKey !== key)) { this.bytes -= r.bytes; this.countRow(r.index, -1); }
     this.order.dropWhere((k) => k === key);
     this.lastByFile.delete(key);
+    this.timeIdx.invalidate();
     this.dirty = true;
   }
 
@@ -323,6 +355,8 @@ export class LogStore {
     for (const k of [...this.lastByFile.keys()]) if (k.startsWith(index + '\u0000')) this.lastByFile.delete(k);
     this.indexes.delete(index);
     this.names.delete(index);
+    this.namesVersion++;
+    this.timeIdx.invalidate();
     this.dirty = true;
   }
 
@@ -420,10 +454,13 @@ export class LogStore {
     const b = this.bounds(req, now);
     const matched: Row[] = [];
     let seen = 0;
-    this.buf.forEach((r) => {
+    const visit = (r: Row) => {
       if (cancelled && ++seen % CANCEL_CHECK_EVERY === 0 && cancelled()) throw new Cancelled();
       if (this.accepts(r, b, pred)) matched.push(r);
-    });
+    };
+    // a time range only visits its own window of the time index
+    if (b.timed) this.timeIdx.forRange(b.from, b.to, visit);
+    else this.buf.forEach(visit);
     if (cancelled?.()) throw new Cancelled();
     const sort = (req.sort ?? []).filter((k) => k && typeof k.field === 'string' && k.field && k.field !== '_source');
     this.sortRows(matched, sort);
@@ -515,7 +552,7 @@ export class LogStore {
     const prefix = (req.prefix ?? '').toLowerCase();
     const counts = new Map<string, number>();
     let sampled = 0, time = false;
-    this.buf.forEachNewest((r) => {
+    const visit = (r: Row) => {
       if (b.idxSet && !b.idxSet.has(r.index)) return true;
       if (b.timed && (r.ts === null || r.ts < b.from || r.ts > b.to)) return true;
       sampled++;
@@ -531,7 +568,9 @@ export class LogStore {
         }
       }
       return sampled < SUGGEST_SAMPLE;
-    });
+    };
+    if (b.timed) this.timeIdx.forRangeNewest(b.from, b.to, visit);
+    else this.buf.forEachNewest(visit);
     const rank = (s: string) => (prefix && !s.toLowerCase().startsWith(prefix) ? 1 : 0);
     const values = [...counts.entries()]
       .sort((a, b) => rank(a[0]) - rank(b[0]) || (time ? (a[0] < b[0] ? 1 : -1) : b[1] - a[1] || (a[0] < b[0] ? -1 : 1)))
@@ -589,7 +628,7 @@ export class LogStore {
       total: matched.length,
       scanned: this.buf.length,
       hits: matched.slice(0, PAGE_SIZE).map(toHit),
-      histogram: histogram(matched, b.timed ? b.from : null, b.timed ? Math.min(b.to, now) : null),
+      histogram: histogram(matched, b.timed ? b.from : null, b.timed ? Math.min(b.to, now) : null, !!this.session?.timeDesc),
       fields: stats.fields,
       fieldSample: stats.sample,
       tookMs: Date.now() - t0,
@@ -602,33 +641,80 @@ export class LogStore {
     };
   }
 
+  /**
+   * Field list with top values over the first STATS_SAMPLE matches (the newest, in default order),
+   * counts scaled up to the whole result. One pass over the sample rows.
+   */
   private fieldStats(matched: Row[]): { fields: FieldStat[]; sample: number } {
     const n = Math.min(matched.length, STATS_SAMPLE);
-    const counts = new Map<string, number>();
-    const vals = new Map<string, Map<string, number>>();
-    for (let i = 0; i < n; i++) {
-      const flat = matched[i].flat;
-      for (const k in flat) {
-        counts.set(k, (counts.get(k) ?? 0) + 1);
-        const v = flat[k];
-        if (v === null || v === undefined) continue;
-        const s = String(v);
-        if (s.length > 120) continue;
-        let m = vals.get(k);
-        if (!m) { m = new Map(); vals.set(k, m); }
-        if (m.size < 2000 || m.has(s)) m.set(s, (m.get(s) ?? 0) + 1);
+    const acc = new StatsAcc();
+    for (let i = 0; i < n; i++) acc.add(matched[i].flat);
+    return { fields: acc.result(matched.length, n), sample: n };
+  }
+}
+
+/** distinct values counted per field: the first ones seen (newest rows); later new values are not counted */
+const STATS_MAX_VALUES = 2000;
+/** longer string values are not counted as top values */
+const STATS_MAX_LEN = 120;
+const STATS_TOP = 5;
+const STATS_MAX_FIELDS = 400;
+
+interface FieldAcc {
+  count: number;
+  /** keyed by the value itself, so numbers are not stringified per row */
+  vals: Map<Primitive, number>;
+  /** vals has non-string keys (5 and "5" must merge when reported) */
+  mixed: boolean;
+}
+
+/** Field presence counts and top-value counts. */
+class StatsAcc {
+  private f = new Map<string, FieldAcc>();
+
+  add(flat: Record<string, Primitive>) {
+    for (const k in flat) {
+      let a = this.f.get(k);
+      if (!a) { a = { count: 0, vals: new Map(), mixed: false }; this.f.set(k, a); }
+      a.count++;
+      const v = flat[k];
+      const c = a.vals.get(v);
+      if (c !== undefined) a.vals.set(v, c + 1);
+      else if (v !== null && a.vals.size < STATS_MAX_VALUES && !(typeof v === 'string' && v.length > STATS_MAX_LEN)) {
+        a.vals.set(v, 1);
+        if (typeof v !== 'string') a.mixed = true;
       }
     }
-    const scale = matched.length / Math.max(n, 1);
-    const fields: FieldStat[] = [];
-    for (const [name, c] of counts) {
-      const m = vals.get(name);
-      const top = m ? [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([v, c2]) => ({ v, c: c2 })) : [];
-      fields.push({ name, count: Math.round(c * scale), top });
-    }
-    fields.sort((a, b) => a.name.localeCompare(b.name));
-    return { fields: fields.slice(0, 400), sample: n };
   }
+
+  result(total: number, n: number): FieldStat[] {
+    const scale = total / Math.max(n, 1);
+    // only the fields that are reported get their top values computed
+    const names = [...this.f.keys()].sort((a, b) => a.localeCompare(b)).slice(0, STATS_MAX_FIELDS);
+    return names.map((name) => {
+      const a = this.f.get(name) as FieldAcc;
+      return { name, count: Math.round(a.count * scale), top: topValues(a) };
+    });
+  }
+}
+
+/** the STATS_TOP most frequent values, without sorting them all; ties keep first-seen order (newest rows) */
+function topValues(a: FieldAcc): { v: string; c: number }[] {
+  let entries: Iterable<[Primitive, number]> = a.vals;
+  if (a.mixed) {
+    const merged = new Map<string, number>();
+    for (const [v, c] of a.vals) { const k = String(v); merged.set(k, (merged.get(k) ?? 0) + c); }
+    entries = merged;
+  }
+  const top: { v: string; c: number }[] = [];
+  for (const [v, c] of entries) {
+    if (top.length === STATS_TOP && c <= top[STATS_TOP - 1].c) continue;
+    let i = top.length;
+    while (i > 0 && top[i - 1].c < c) i--;
+    top.splice(i, 0, { v: String(v), c });
+    if (top.length > STATS_TOP) top.pop();
+  }
+  return top;
 }
 
 function dedupeTerms(terms: HighlightTerm[]): HighlightTerm[] {
@@ -647,10 +733,19 @@ function toHit(r: Row): Hit {
 
 const NICE_BUCKETS = [1e3, 5e3, 1e4, 3e4, 6e4, 3e5, 6e5, 18e5, 36e5, 108e5, 216e5, 432e5, 864e5, 6048e5];
 
-export function histogram(matched: Row[], from: number | null, to: number | null) {
+/**
+ * @param newestFirst `matched` is sorted newest first with untimed rows last, so the time span is
+ *   read off its two ends instead of a scan
+ */
+export function histogram(matched: Row[], from: number | null, to: number | null, newestFirst = false) {
   let lo: number, hi: number;
   if (from !== null && to !== null && isFinite(from) && isFinite(to)) { lo = from; hi = to; }
-  else {
+  else if (newestFirst) {
+    hi = matched.length ? matched[0].ts ?? -Infinity : -Infinity;
+    let j = matched.length - 1;
+    while (j >= 0 && matched[j].ts === null) j--;
+    lo = j >= 0 ? (matched[j].ts as number) : Infinity;
+  } else {
     lo = Infinity; hi = -Infinity;
     for (const r of matched) if (r.ts !== null) { if (r.ts < lo) lo = r.ts; if (r.ts > hi) hi = r.ts; }
   }

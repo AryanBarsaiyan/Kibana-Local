@@ -27,15 +27,18 @@ Three runtimes, connected by message passing:
 Engine modules (`src/engine/`, pure Node, no `vscode` import — keep it that way so tests run without VS Code):
 - `types.ts` — shared types (`Row`, `Filter`, `QueryRequest/Result`, `StoreLimits`, `PAGE_SIZE`)
 - `parse.ts` — line parsing, `flatten`, timestamp parsing, ts/level/msg field auto-detection
-- `query.ts` — KQL-like query compiler (`compileQuery`, `compileFilters`, highlights)
+- `query.ts` — KQL-like query compiler (`compileQuery`, `compileFilters`, highlights); value matchers are memoized per distinct short string (`memo`)
 - `store.ts` — `LogStore`: ingest, per-index field detection, query/tick (incremental)/page/suggest/context, histogram, row & memory caps
-- `ring.ts` — `RowBuffer` / `EvictionOrder` for eviction under `maxRows` / `maxMemoryMB`
-- `tailer.ts` — `FileTailer` / `FolderTailer` polling tailers (`LOG_EXT` decides which files a folder index picks up)
+- `dict.ts` — `ValueDict`: dictionary encoding of low-cardinality string values (shared instances + cached lowercase); fields past `DICT_MAX_DISTINCT` values are left alone
+- `ring.ts` — `RowBuffer` (arrival order) / `TimeIndex` ((ts, id)-sorted, for time-range scans) / `EvictionOrder` for eviction under `maxRows` / `maxMemoryMB`
+- `tailer.ts` — `FileTailer` / `FolderTailer` polling tailers (`LOG_EXT` decides which files a folder index picks up; idle files in a folder back off via `pollEvery`)
 
 ## Conventions and gotchas
 
 - Webview input is untrusted: sanitize with `src/sanitize.ts` (`cleanFilters`, `cleanRange`, `cleanIndexes`, …) in `panel.ts` before it reaches the worker; add a case to `test/sanitize.test.ts` for new message fields.
 - Log lines are untrusted too: flattened rows are plain objects, but a `__proto__` key is stored as an own property (`setField`). Read row fields with `own(flat, key)` (engine `parse.ts`, webview `lib/format.ts`), never `flat[key]`, so `constructor`/`toString` never resolve to `Object.prototype`. Tailers cut lines at `MAX_LINE_CHARS`.
+- Memory: the per-row byte-estimate constants in `store.ts` (`ROW_BYTES`, `FIELD_BYTES`, `STR_BYTES`) are calibrated by `test/memory.test.ts` (estimate/heap ratio and a heap/file-size guard). Re-run it after changing what a `Row` holds. Build per-row strings with `join()`, not `+=` (V8 keeps `+=` results as ropes that cost several times their length until first read). Anything that changes `row.ts` or bulk-removes rows must call `TimeIndex.invalidate()`.
+- Measured and rejected (don't redo without new evidence): sending ingest batches as one joined string (structured clone of `string[]` costs the same, and `split()` in the worker yields sliced strings that pin whole batches); incremental field stats on ticks (high-cardinality fields like timestamps need a full pass over the 10k sample anyway).
 - Webview CSP has no `'unsafe-inline'`: never put inline `style=` in HTML strings in `webview/`; set styles via `el.style.*`.
 - Rows carry `fileKey = index + '\0' + fullPath`; use it (not `file`, which is a display basename) to identify sources.
 - Settings live under `logscope.*` in `package.json` `contributes.configuration`; new settings must be read in `panel.ts` and passed to the worker as `StoreLimits` / field overrides.

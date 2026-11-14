@@ -84,8 +84,39 @@ export function getField(r: Row, f: string, ctx: QueryContext): Primitive | unde
   return v;
 }
 
-function valueMatcher(raw: string, quoted: boolean): (v: Primitive | undefined) => boolean {
-  if (!quoted && raw === '*') return (v) => v !== undefined && v !== null && v !== '';
+type ValueMatch = (v: Primitive | undefined) => boolean;
+
+/** strings up to this length are memoized; longer ones are rarely repeated */
+const MEMO_MAX_LEN = 64;
+const MEMO_MAX_SIZE = 4096;
+
+/**
+ * Remember a matcher's answer per distinct short string. Low-cardinality fields (level, service,
+ * method, …) then cost one map lookup per row: each distinct value is lowercased and tested once
+ * per query instead of once per row. High-cardinality values just miss (the cache stops growing).
+ */
+function memo(m: ValueMatch): ValueMatch {
+  const cache = new Map<string, boolean>();
+  return (v) => {
+    if (typeof v !== 'string' || v.length > MEMO_MAX_LEN) return m(v);
+    let r = cache.get(v);
+    if (r === undefined) {
+      r = m(v);
+      if (cache.size < MEMO_MAX_SIZE) cache.set(v, r);
+    }
+    return r;
+  };
+}
+
+const exists: ValueMatch = (v) => v !== undefined && v !== null && v !== '';
+
+function valueMatcher(raw: string, quoted: boolean): ValueMatch {
+  return !quoted && raw === '*' ? exists : memo(rawMatcher(raw, quoted));
+}
+
+/** like {@link valueMatcher}, unmemoized (for use inside a memoized group) */
+function rawMatcher(raw: string, quoted: boolean): ValueMatch {
+  if (!quoted && raw === '*') return exists;
   const lower = raw.toLowerCase();
   if (!quoted && raw.includes('*')) {
     const re = wildcardRe(raw, true);
@@ -159,7 +190,7 @@ export function compileQuery(src: string, ctx: QueryContext, collect?: Highlight
   }
   function parseValueGroup(field: string): Pred {
     // after "field:(" — values separated by or/and
-    const ms: { m: (v: Primitive | undefined) => boolean; neg: boolean }[] = [];
+    const ms: { m: ValueMatch; neg: boolean }[] = [];
     let mode: 'or' | 'and' = 'or';
     while (peek() && peek().t !== ')') {
       const tk = toks[p++];
@@ -167,20 +198,22 @@ export function compileQuery(src: string, ctx: QueryContext, collect?: Highlight
       if (tk.t === 'word' && tk.v.toLowerCase() === 'not') {
         const nx = toks[p++];
         if (!nx || (nx.t !== 'word' && nx.t !== 'str')) throw new QueryError('Expected value after not');
-        ms.push({ m: valueMatcher(nx.v, nx.t === 'str'), neg: true });
+        ms.push({ m: rawMatcher(nx.v, nx.t === 'str'), neg: true });
         continue;
       }
       if (tk.t !== 'word' && tk.t !== 'str') throw new QueryError(`Unexpected token in value group for ${field}`);
-      ms.push({ m: valueMatcher(tk.v, tk.t === 'str'), neg: false });
+      ms.push({ m: rawMatcher(tk.v, tk.t === 'str'), neg: false });
       hlValue(field, tk.v, tk.t === 'str');
     }
     if (!peek()) throw new QueryError('Missing )');
     p++;
-    return (r) => {
-      const v = getField(r, field, ctx);
-      const res = ms.map((x) => (x.neg ? !x.m(v) : x.m(v)));
-      return mode === 'and' ? res.every(Boolean) : res.some(Boolean);
-    };
+    const all = mode === 'and';
+    // the whole group is memoized once, so its members are not memoized separately
+    const m = memo((v) => {
+      for (const x of ms) if ((x.m(v) !== x.neg) !== all) return !all;
+      return all;
+    });
+    return (r) => m(getField(r, field, ctx));
   }
   function hlValue(field: string, val: string, quoted: boolean) {
     if (!quoted && val === '*') return;
@@ -257,10 +290,16 @@ export function compileQuery(src: string, ctx: QueryContext, collect?: Highlight
 }
 
 /** Exact value match (strings case-insensitive), as used by filter pills. */
-function equalsMatcher(value: Primitive | undefined): (v: Primitive | undefined) => boolean {
+function equalsMatcher(value: Primitive | undefined): ValueMatch {
   if (value === null) return (v) => v === null;
   const want = String(value).toLowerCase();
-  return (v) => v !== undefined && v !== null && String(v).toLowerCase() === want;
+  return (v) => {
+    if (v === undefined || v === null) return false;
+    const s = String(v);
+    // Lowercasing preserves length except for U+0130 (İ → i̇), so most mismatches skip the allocation.
+    if (s.length !== want.length && !s.includes('İ')) return false;
+    return s.toLowerCase() === want;
+  };
 }
 
 function filterPred(f: Filter, ctx: QueryContext): Pred {
@@ -275,13 +314,14 @@ function filterPred(f: Filter, ctx: QueryContext): Pred {
   if (!field || !FIELD_RE.test(field)) throw new QueryError(`Filter has an invalid field name: "${field ?? ''}"`);
   switch (f.op) {
     case 'is': {
-      const m = equalsMatcher(f.value);
+      const m = memo(equalsMatcher(f.value));
       return (r) => m(getField(r, field, ctx));
     }
     case 'is_one_of': {
       const ms = (f.values ?? []).map(equalsMatcher);
       if (!ms.length) throw new QueryError(`Filter on ${field} needs at least one value`);
-      return (r) => { const v = getField(r, field, ctx); return ms.some((m) => m(v)); };
+      const m = memo((v) => ms.some((x) => x(v)));
+      return (r) => m(getField(r, field, ctx));
     }
     case 'between': {
       const gte = (f.gte ?? '').trim(), lte = (f.lte ?? '').trim();
@@ -290,10 +330,8 @@ function filterPred(f: Filter, ctx: QueryContext): Pred {
       const hi = lte ? compare('<=', field, lte, ctx) : null;
       return (r) => (!lo || lo(r)) && (!hi || hi(r));
     }
-    case 'exists': {
-      const m = valueMatcher('*', false);
-      return (r) => m(getField(r, field, ctx));
-    }
+    case 'exists':
+      return (r) => exists(getField(r, field, ctx));
     default:
       throw new QueryError(`Unknown filter operator: ${String((f as Filter).op)}`);
   }

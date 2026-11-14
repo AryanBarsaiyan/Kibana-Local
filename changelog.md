@@ -2,6 +2,9 @@
 # Changelog
 
 ## Unreleased
+- **About half the memory per line**: repeated short values (level, service, host, …) share one copy, and the lowercased search text is stored compactly. A 51 MB file now takes ~164 MB in memory instead of ~283 MB, and the memory budget (`logscope.maxMemoryMB`) is measured accurately (it used to under-count by ~25%, so usage could exceed the budget).
+- **Faster time-range searches**: lines are indexed by timestamp, so a search over the last 15 minutes only visits those lines (2–3× faster on 200k lines). Field searches like `level:ERROR` test each distinct value once per search instead of once per line; live updates are ~1.6× faster.
+- Folder indexes with many files check idle files less often (down to every 8th poll). Changes still show up immediately through file-system events; where those don't work (network or Docker mounts), a file that was idle is noticed within 16 s at the default 2 s poll interval.
 - **Faster typing in the search box on big indexes**: a new search now cancels the one still running in the worker (it stops mid-scan) and skips queued refreshes, so only the latest query does any work.
 - **Large initial loads no longer flood the engine**: file reading pauses while the worker catches up, so memory stays flat when an index starts with hundreds of MB.
 - **Very long lines** (over 1M characters, or a line still being written with no newline) are cut with `…[line truncated]` instead of being buffered whole.
