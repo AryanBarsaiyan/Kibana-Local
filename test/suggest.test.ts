@@ -104,7 +104,25 @@ test('field names are known regardless of hits, per index selection', () => {
   const r = s.query({ q: 'nothing-matches-this', indexes: ['app'], range: all });
   assert.equal(r.total, 0);
   assert.deepEqual(r.fieldNames, ['code', 'level', 'message', 'svc', 'ts']);
-  assert.ok(s.query({ q: '', indexes: [], range: all }).fieldNames.includes('svc'));
+  assert.ok(s.query({ q: '', indexes: [], range: all }).fieldNames?.includes('svc'));
   s.dropIndex('app');
   assert.deepEqual(s.query({ q: '', indexes: ['app'], range: all }).fieldNames, []);
+});
+
+test('ticks send field names and detected fields only when they changed', () => {
+  const s = store();
+  const q = s.query({ q: '', indexes: [], range: all });
+  assert.ok(q.fieldNames && q.detected);
+  const row = (extra: object) => JSON.stringify({ ts: T0 + 1e9, level: 'INFO', message: 'm', ...extra });
+  s.ingest('app', '/app.log', [row({ svc: 'x' })]);
+  const t1 = s.tick()!;
+  assert.equal(t1.reset, false);
+  assert.equal(t1.fieldNames, undefined);
+  assert.equal(t1.detected, undefined);
+  s.ingest('app', '/app.log', [row({ brandNew: 1 })]);
+  assert.ok(s.tick()!.fieldNames?.includes('brandNew'));
+  s.ingest('app', '/app.log', [row({ svc: 'y' })]);
+  assert.equal(s.tick()!.fieldNames, undefined);
+  s.ingest('fresh', '/fresh.log', [row({})]);
+  assert.ok(s.tick()!.detected?.fresh);
 });

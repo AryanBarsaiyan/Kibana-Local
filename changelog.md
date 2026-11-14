@@ -2,6 +2,9 @@
 # Changelog
 
 ## Unreleased
+- **View surrounding documents opens instantly on big indexes**: it now walks outward from the selected line through the time index instead of scanning and sorting every loaded line (~18 ms → ~0.03 ms on 200k lines).
+- Live updates no longer resend the full field-name list (up to 2,000 names per index) and detected fields every refresh; they are sent only when they change.
+- Folder indexes rescan the directory at most once per 250 ms while files are being written, instead of on every write.
 - A read error partway through a file (network drive hiccup, file locked by another process) no longer loads the lines already read a second time; reading resumes where it stopped.
 - A non-ASCII character that a logger was still writing when the file was polled is no longer shown as `�`.
 - A field named `constructor` (or `toString`, …) shows its own name in the column header and sort indicator instead of JavaScript source text.
@@ -15,7 +18,7 @@
 - **Very long lines** (over 1M characters, or a line still being written with no newline) are cut with `…[line truncated]` instead of being buffered whole.
 - Hardened against hostile log content: fields named `__proto__`, `constructor`, `toString` etc. are ordinary fields (previously `constructor:*` matched every line, and a `__proto__` field was silently dropped); deeply nested or unserializable JSON no longer aborts the rest of a batch; a single line with thousands of keys no longer bloats field autocomplete; queries nested too deeply or longer than 10,000 characters report an error.
 - Messages from the panel UI are validated more strictly (time range, index names, columns, numbers and text lengths).
-- **Wildcard searches can no longer freeze the engine**: a query like `a*a*a*a*a*a*a*a*b` used to backtrack for minutes on a single long line (and ran again every time the panel opened, since the query is saved). Wildcards are now matched piece by piece in linear time, in the engine and in result highlighting. A `*` in a field search now also matches across line breaks inside a value.
+- **Wildcard searches can no longer freeze the engine**: a query like `a*a*a*a*a*a*a*a*b` used to backtrack for minutes on a single long line (and ran again every time the panel opened, since the query is saved). Wildcards are now matched piece by piece in linear time, in the engine and in result highlighting. A `*` in a field search now also matches across line breaks inside a value; a free-text wildcard like `err*full` still has to match within one field value.
 - Typing a path into the panel's **Add index** box now asks for confirmation before KibanaLocal reads it; paths picked with **Browse…** and the sidebar/command-palette commands are added directly.
 - Saved indexes are validated when a workspace is reopened; malformed entries (or ones with a relative path) are skipped.
 - Folder indexes follow symbolic links only to files inside the folder, not out of it.

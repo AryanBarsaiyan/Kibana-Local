@@ -99,15 +99,38 @@ test('wildcards run in linear time: no regex backtracking on long non-matching l
   assert.equal(s.query(all('a*x*c')).total, 1);
 });
 
+test('free-text wildcards match within one field value, not across fields', () => {
+  const s = store();
+  s.ingest('i', '/a.log', [
+    JSON.stringify({ level: 'error', msg: 'disk full' }),
+    JSON.stringify({ level: 'info', msg: 'request timeout' }),
+  ]);
+  assert.equal(s.query(all('err*full')).total, 0, 'pieces in different fields');
+  assert.equal(s.query(all('info*timeout')).total, 0, 'pieces in different fields');
+  assert.equal(s.query(all('dis*ful')).total, 1);
+  assert.equal(s.query(all('req*time*')).total, 1);
+  assert.equal(s.query(all('*out')).total, 1);
+  // a later line can still match after an earlier one fails partway
+  assert.equal(wildcardMatcher('a*b', false)('a\nxa\nab\n'), true);
+  assert.equal(wildcardMatcher('a*b*c', false)('ab\nbc\nabc'), true);
+  assert.equal(wildcardMatcher('a*b*c', false)('ab\nbc\nac'), false);
+  // still linear on many long lines that each fail on the last piece
+  const many = Array.from({ length: 200 }, () => 'a'.repeat(5000)).join('\n');
+  const t0 = Date.now();
+  assert.equal(wildcardMatcher('a*a*a*a*a*a*a*a*b', false)(many), false);
+  assert.ok(Date.now() - t0 < 500, `took ${Date.now() - t0} ms`);
+});
+
 test('wildcardMatcher agrees with the equivalent regex', () => {
   const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const rnd = (n: number, a: string) => Array.from({ length: n }, () => a[Math.floor(Math.random() * a.length)]).join('');
   for (let i = 0; i < 3000; i++) {
     const pat = rnd(1 + Math.floor(Math.random() * 6), 'ab*');
     if (!pat.includes('*')) continue;
-    const text = rnd(Math.floor(Math.random() * 8), 'ab');
-    const body = pat.split('*').map(esc).join('[\\s\\S]*');
+    const text = rnd(Math.floor(Math.random() * 10), 'ab\n');
     for (const anchored of [true, false]) {
+      // a field value's `*` spans line breaks; free text stays within one line (one field value)
+      const body = pat.split('*').map(esc).join(anchored ? '[\\s\\S]*' : '[^\\n]*');
       const want = new RegExp(anchored ? `^${body}$` : body).test(text);
       assert.equal(wildcardMatcher(pat, anchored)(text), want, `${pat} ${anchored} ${text}`);
     }

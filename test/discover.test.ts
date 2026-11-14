@@ -164,6 +164,39 @@ test('context: only this file, and index selection', () => {
   assert.deepEqual([file.newer[0].flat.n, file.older[0].flat.n], [6, 4]);
 });
 
+test('context matches a full sort, with untimed and out-of-order rows', () => {
+  let seed = 7;
+  const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const s = new LogStore({ maxRows: 10_000, maxBytes: 1e9 });
+  for (let b = 0; b < 20; b++) {
+    const file = b % 2 ? '/logs/x.log' : '/logs/y.log';
+    const lines: string[] = [];
+    for (let k = 0; k < 10; k++) {
+      const n = b * 10 + k;
+      const svc = rnd(2) ? 'api' : 'web';
+      // a few untimed rows, repeated timestamps and out-of-order arrival
+      lines.push(rnd(5) === 0 ? JSON.stringify({ n, svc }) : line(rnd(60), { n, svc }));
+    }
+    s.ingest(b % 3 ? 'a' : 'b', file, lines);
+  }
+  const all = s.page(0, s.query(req()).total);
+  const filters = [f({ field: 'svc', value: 'api' })];
+  for (const anchor of all) {
+    const cases: { indexes: string[]; sameFile: boolean; filters?: Filter[] }[] = [{ indexes: [], sameFile: false }, { indexes: ['a'], sameFile: false, filters }, { indexes: [], sameFile: true }];
+    for (const opts of cases) {
+      const c = s.context({ id: anchor.id, newer: 4, older: 3, ...opts });
+      const p = all.indexOf(anchor);
+      const keep = (h: typeof anchor) => (opts.sameFile ? h.file === anchor.file && h.index === anchor.index : !opts.indexes.length || opts.indexes.includes(h.index))
+        && (!opts.filters || h.flat.svc === 'api');
+      const newer = all.slice(0, p).filter(keep), older = all.slice(p + 1).filter(keep);
+      assert.deepEqual(c.newer.map((h) => h.id), newer.slice(Math.max(0, newer.length - 4)).map((h) => h.id));
+      assert.deepEqual(c.older.map((h) => h.id), older.slice(0, 3).map((h) => h.id));
+      assert.equal(c.moreNewer, newer.length > 4);
+      assert.equal(c.moreOlder, older.length > 3);
+    }
+  }
+});
+
 test('context for a document that is no longer loaded', () => {
   const c = store().context({ id: 999_999, newer: 5, older: 5, indexes: [], sameFile: false });
   assert.equal(c.anchor, null);

@@ -136,6 +136,26 @@ test('folder index picks up new files from the start', async () => {
   t.dispose();
 });
 
+test('folder change events are coalesced into few directory scans', async (tt) => {
+  const { dir, got, ev } = harness();
+  const f = path.join(dir, 'a.log');
+  fs.writeFileSync(f, '');
+  const t = new FolderTailer(dir, ev, 1 << 20);
+  t.start();
+  const orig = realFs.readdirSync;
+  let scans = 0;
+  tt.mock.method(realFs, 'readdirSync', ((...args: Parameters<typeof orig>) => { scans++; return orig(...args); }) as typeof orig);
+  // a burst of writes: each may fire a folder watch event
+  for (let i = 0, end = Date.now() + 200; Date.now() < end; i++) { fs.appendFileSync(f, `{"i":${i}}\n`); await wait(1); }
+  await wait(300);
+  assert.ok(scans <= 2, `expected the burst to share scans, got ${scans}`);
+  // a new file is still found from watch events alone (no poke)
+  fs.writeFileSync(path.join(dir, 'b.log'), '{"f":"b"}\n');
+  for (let i = 0; i < 30 && !got.includes('{"f":"b"}'); i++) await wait(100);
+  assert.ok(got.includes('{"f":"b"}'));
+  t.dispose();
+});
+
 test('no lines are emitted after dispose, even mid-read', async () => {
   const { dir, got, ev } = harness();
   const f = path.join(dir, 'big.log');

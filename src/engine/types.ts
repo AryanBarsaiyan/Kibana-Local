@@ -157,14 +157,18 @@ export interface QueryResult {
   reset: boolean;
   /** incremental only: number of new hits inserted at the top, or -1 if positions shifted arbitrarily */
   prepended: number;
-  detected: Record<string, DetectedFields>;
+  /** omitted on incremental results when unchanged since the previous result (keep the last one) */
+  detected?: Record<string, DetectedFields>;
   memoryBytes: number;
   /** retained rows per index (the row limit applies to each) */
   indexRows: Record<string, number>;
   /** search terms to highlight in the results */
   highlight: HighlightTerm[];
-  /** every field name seen in the selected indexes, regardless of hits (for autocomplete) */
-  fieldNames: string[];
+  /**
+   * every field name seen in the selected indexes, regardless of hits (for autocomplete);
+   * omitted on incremental results when unchanged since the previous result (keep the last one)
+   */
+  fieldNames?: string[];
   error?: string;
 }
 

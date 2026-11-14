@@ -313,6 +313,11 @@ export function renderAll() {
 // ---------- results ----------
 export function applyResult(seq, r) {
   const prev = S.result;
+  // incremental results leave out field names / detected fields that did not change
+  if (!r.reset && prev) {
+    if (r.fieldNames === undefined) r.fieldNames = prev.fieldNames;
+    if (r.detected === undefined) r.detected = prev.detected;
+  }
   S.seq = seq;
   S.result = r;
   S.detected = r.detected || {};

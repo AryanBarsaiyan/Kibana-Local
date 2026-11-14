@@ -10,6 +10,8 @@ export const TRUNCATED_MARK = ' …[line truncated]';
 /** a batch is emitted once it holds this many lines or characters */
 const BATCH_LINES = 20_000;
 const BATCH_CHARS = 8 << 20;
+/** folder change events within this window share one directory scan */
+export const FOLDER_SCAN_MS = 250;
 
 /**
  * Poll backoff for idle files of a folder index: after this many polls without growth a file is
@@ -272,6 +274,7 @@ export function isInside(dir: string, target: string): boolean {
 export class FolderTailer implements Tailer {
   private tailers = new Map<string, FileTailer>();
   private watcher: fs.FSWatcher | null = null;
+  private scanTimer: NodeJS.Timeout | null = null;
   private first = true;
 
   constructor(readonly dir: string, private ev: TailerEvents, private initialBytes: number) {}
@@ -279,7 +282,12 @@ export class FolderTailer implements Tailer {
   start() {
     this.scan();
     try {
-      this.watcher = fs.watch(this.dir, () => this.scan());
+      // The folder watch fires on every write to any file in it, and each file already has its
+      // own watcher for content: coalesce events into at most one (synchronous) scan per window.
+      // Not a trailing debounce, which would starve under continuous writes.
+      this.watcher = fs.watch(this.dir, () => {
+        this.scanTimer ??= setTimeout(() => { this.scanTimer = null; this.scan(); }, FOLDER_SCAN_MS);
+      });
       this.watcher.on('error', () => { this.watcher?.close(); this.watcher = null; });
     } catch { /* poll covers it */ }
   }
@@ -321,6 +329,8 @@ export class FolderTailer implements Tailer {
 
   dispose() {
     this.watcher?.close();
+    this.watcher = null;
+    if (this.scanTimer) { clearTimeout(this.scanTimer); this.scanTimer = null; }
     for (const t of this.tailers.values()) t.dispose();
     this.tailers.clear();
   }

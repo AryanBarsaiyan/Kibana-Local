@@ -71,19 +71,36 @@ function escapeRe(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
  * and costs one pass per piece. A regex like /a.*a.*a.*b/ backtracks with an exponent equal to the
  * number of stars on a long line that does not match, and a test that runs inside one regex call
  * cannot be cancelled.
+ *
+ * Unanchored (free text over `row.lower`, where field values are separated by '\n'): every piece
+ * must sit on the same line, so `err*full` does not match `error` in one field and `disk full`
+ * in another. Anchored (one field value): `*` also spans line breaks inside the value.
  */
 export function wildcardMatcher(pattern: string, anchored: boolean): (s: string) => boolean {
   const parts = pattern.toLowerCase().split('*');
   if (!anchored) {
     const pieces = parts.filter(Boolean);
     return (s) => {
-      let at = 0;
-      for (const p of pieces) {
-        const i = s.indexOf(p, at);
-        if (i < 0) return false;
-        at = i + p.length;
+      let line = 0;
+      for (;;) {
+        let at = line, stop = -1, ok = true;
+        for (const p of pieces) {
+          const i = s.indexOf(p, at);
+          if (i < 0) return false;
+          if (stop < 0) {
+            const e = s.indexOf('\n', i);
+            stop = e < 0 ? s.length : e;
+          } else if (i + p.length > stop) {
+            // no match can finish on the first piece's line, nor on any line before the one this
+            // piece was found on (it does not occur there): retry from that line
+            line = Math.max(stop + 1, s.lastIndexOf('\n', i) + 1);
+            ok = false;
+            break;
+          }
+          at = i + p.length;
+        }
+        if (ok) return true;
       }
-      return true;
     };
   }
   // anchored: the first piece is a prefix, the last a suffix, the rest sit in between in order

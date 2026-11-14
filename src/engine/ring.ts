@@ -35,6 +35,37 @@ export class RowBuffer {
     }
   }
 
+  /** position of the row with this id (ids only increase, so the array is sorted by id), or -1 */
+  private indexOf(id: number): number {
+    const a = this.a;
+    let lo = 0, hi = a.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (a[mid].id < id) lo = mid + 1; else hi = mid;
+    }
+    return lo < a.length && a[lo].id === id ? lo : -1;
+  }
+
+  /** the live row with this id, by binary search */
+  get(id: number): Row | undefined {
+    const i = this.indexOf(id);
+    return i >= 0 && !this.a[i].dead ? this.a[i] : undefined;
+  }
+
+  /**
+   * Live rows that arrived after (dir 1) or before (dir -1) the row with this id, nearest first;
+   * stops when fn returns false.
+   */
+  walkFrom(id: number, dir: 1 | -1, fn: (r: Row) => boolean) {
+    const a = this.a;
+    const at = this.indexOf(id);
+    if (at < 0) return;
+    for (let i = at + dir; i >= 0 && i < a.length; i += dir) {
+      const r = a[i];
+      if (!r.dead && !fn(r)) return;
+    }
+  }
+
   /** keep only rows matching pred; returns removed rows (flagged dead) */
   retain(pred: (r: Row) => boolean): Row[] {
     const kept: Row[] = [], removed: Row[] = [];
@@ -127,6 +158,27 @@ export class TimeIndex {
     for (let i = TimeIndex.bound(a, from, false); i < end; i++) {
       const r = a[i];
       if (!r.dead) fn(r);
+    }
+  }
+
+  /**
+   * Live rows after (dir 1: later in (ts, id) order) or before (dir -1) row `r`, nearest first;
+   * stops when fn returns false. `r` must have a timestamp; with `r` null and dir 1, walks every
+   * row from the oldest.
+   */
+  walkFrom(r: Row | null, dir: 1 | -1, fn: (r: Row) => boolean) {
+    const a = this.ready();
+    // first position strictly after r
+    let lo = 0, hi = a.length;
+    if (r) {
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (byTime(a[mid], r) <= 0) lo = mid + 1; else hi = mid;
+      }
+    } else if (dir < 0) return;
+    for (let i = dir > 0 ? lo : lo - 1; i >= 0 && i < a.length; i += dir) {
+      const x = a[i];
+      if (x !== r && !x.dead && !fn(x)) return;
     }
   }
 

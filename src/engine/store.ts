@@ -135,6 +135,9 @@ interface Session {
   /** newest first by time: rows that age out of a sliding range sit at the end */
   timeDesc: boolean;
   highlight: HighlightTerm[];
+  /** namesVersion / detectedVersion last sent in a result, so ticks can leave them out */
+  sentNames: number;
+  sentDetected: number;
 }
 
 interface Bounds { idxSet: Set<string> | null; from: number; to: number; timed: boolean }
@@ -155,6 +158,8 @@ export class LogStore {
   /** bumped whenever a field name is added or removed (invalidates the sorted-names cache) */
   private namesVersion = 0;
   private namesCache: { key: string; version: number; list: string[] } | null = null;
+  /** bumped whenever any index's detected ts/level/msg fields change */
+  private detectedVersion = 0;
   private bytes = 0;
 
   private session: Session | null = null;
@@ -184,6 +189,7 @@ export class LogStore {
       st.detected = detectFields(st.samples, o);
       this.recomputeTs(name);
     }
+    this.detectedVersion++;
     this.dirty = true;
   }
 
@@ -197,6 +203,7 @@ export class LogStore {
     if (!st) {
       st = { samples: [], locked: false, detected: { ts: null, level: null, msg: null } };
       this.indexes.set(index, st);
+      this.detectedVersion++;
     }
     return st;
   }
@@ -235,9 +242,11 @@ export class LogStore {
         st.samples.push(flat);
         const n = st.samples.length;
         if (n < 25 || n % 25 === 0) {
-          const before = st.detected.ts;
+          const before = st.detected;
           st.detected = detectFields(st.samples, this.overrides);
-          if (before !== st.detected.ts) { this.recomputeTs(index); this.dirty = true; }
+          const d = st.detected;
+          if (before.ts !== d.ts) { this.recomputeTs(index); this.dirty = true; }
+          if (before.ts !== d.ts || before.level !== d.level || before.msg !== d.msg) this.detectedVersion++;
         }
         if (n >= DETECT_SAMPLES) st.locked = true;
       }
@@ -379,6 +388,7 @@ export class LogStore {
     this.order.dropWhere((k) => k.startsWith(index + '\u0000'));
     for (const k of [...this.lastByFile.keys()]) if (k.startsWith(index + '\u0000')) this.lastByFile.delete(k);
     this.indexes.delete(index);
+    this.detectedVersion++;
     this.names.delete(index);
     this.namesVersion++;
     this.timeIdx.invalidate();
@@ -490,7 +500,7 @@ export class LogStore {
     const sort = (req.sort ?? []).filter((k) => k && typeof k.field === 'string' && k.field && k.field !== '_source');
     this.sortRows(matched, sort);
     if (cancelled?.()) throw new Cancelled();
-    this.session = { req, pred, matched, cmp: this.makeCmp(sort), timeDesc: isDefaultSort(sort), highlight: dedupeTerms(highlight) };
+    this.session = { req, pred, matched, cmp: this.makeCmp(sort), timeDesc: isDefaultSort(sort), highlight: dedupeTerms(highlight), sentNames: -1, sentDetected: -1 };
     this.pendingNew = [];
     this.touched.clear();
     this.evicted = false;
@@ -609,9 +619,7 @@ export class LogStore {
    * neighbours in time, from the selected indexes, with the filters applied but not the query.
    */
   context(req: ContextRequest): ContextResult {
-    let anchor: Row | null = null;
-    this.buf.forEach((r) => { if (r.id === req.id) anchor = r; });
-    const a = anchor as Row | null;
+    const a = this.buf.get(req.id);
     if (!a) return { anchor: null, newer: [], older: [], moreNewer: false, moreOlder: false, error: 'That document is no longer loaded (it was dropped by a limit or its file was reloaded).' };
     let fp: Pred | null;
     try {
@@ -620,19 +628,28 @@ export class LogStore {
       return { anchor: toHit(a), newer: [], older: [], moreNewer: false, moreOlder: false, error: e instanceof Error ? e.message : String(e) };
     }
     const idxSet = req.indexes.length ? new Set(req.indexes) : null;
-    const newer: Row[] = [], older: Row[] = [];
-    this.buf.forEach((r) => {
-      if (r === a) return;
-      if (req.sameFile ? r.fileKey !== a.fileKey : idxSet && !idxSet.has(r.index)) return;
-      if (fp && !fp(r)) return;
-      (cmp(r, a) < 0 ? newer : older).push(r);
-    });
-    newer.sort(cmp);
-    older.sort(cmp);
+    const keep = (r: Row) => (req.sameFile ? r.fileKey === a.fileKey : !idxSet || idxSet.has(r.index)) && (!fp || fp(r));
     const nN = Math.max(0, Math.floor(req.newer)), nO = Math.max(0, Math.floor(req.older));
+    // Walk outward from the anchor in display order (newest first by time, then arrival; rows
+    // without a timestamp sort below all timed rows), nearest first, one past each limit to tell
+    // whether more exist. Timed rows come from the time index, untimed ones from arrival order.
+    const newer: Row[] = [], older: Row[] = [];
+    const into = (out: Row[], limit: number, untimedOnly: boolean) => (r: Row) => {
+      if ((!untimedOnly || r.ts === null) && keep(r)) out.push(r);
+      return out.length <= limit;
+    };
+    if (a.ts !== null) {
+      this.timeIdx.walkFrom(a, 1, into(newer, nN, false));
+      this.timeIdx.walkFrom(a, -1, into(older, nO, false));
+      if (older.length <= nO) this.buf.forEachNewest(into(older, nO, true));
+    } else {
+      this.buf.walkFrom(a.id, 1, into(newer, nN, true));
+      if (newer.length <= nN) this.timeIdx.walkFrom(null, 1, into(newer, nN, false));
+      this.buf.walkFrom(a.id, -1, into(older, nO, true));
+    }
     return {
       anchor: toHit(a),
-      newer: newer.slice(Math.max(0, newer.length - nN)).map(toHit),
+      newer: newer.slice(0, nN).reverse().map(toHit),
       older: older.slice(0, nO).map(toHit),
       moreNewer: newer.length > nN,
       moreOlder: older.length > nO,
@@ -649,6 +666,12 @@ export class LogStore {
   private build(matched: Row[], req: QueryRequest, now: number, t0: number, reset: boolean, prepended: number): QueryResult {
     const b = this.bounds(req, now);
     const stats = this.fieldStats(matched);
+    // field names (up to MAX_FIELD_NAMES per index) and detected fields rarely change while
+    // tailing: incremental results leave them out unless they changed since the last result
+    const s = this.session;
+    const sendNames = reset || !s || s.sentNames !== this.namesVersion;
+    const sendDetected = reset || !s || s.sentDetected !== this.detectedVersion;
+    if (s) { s.sentNames = this.namesVersion; s.sentDetected = this.detectedVersion; }
     return {
       total: matched.length,
       scanned: this.buf.length,
@@ -658,11 +681,11 @@ export class LogStore {
       fieldSample: stats.sample,
       tookMs: Date.now() - t0,
       reset, prepended,
-      detected: this.detectedMap(),
+      detected: sendDetected ? this.detectedMap() : undefined,
       memoryBytes: this.bytes,
       indexRows: this.indexRows(),
-      highlight: this.session?.highlight ?? [],
-      fieldNames: this.fieldNames(req.indexes),
+      highlight: s?.highlight ?? [],
+      fieldNames: sendNames ? this.fieldNames(req.indexes) : undefined,
     };
   }
 
