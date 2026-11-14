@@ -40,6 +40,12 @@ port.on('message', (m: ToWorker) => {
       case 'page':
         send({ type: 'page', reqId: m.reqId, hits: store.page(m.offset, m.count) });
         break;
+      case 'context':
+        send({ type: 'context', reqId: m.reqId, result: store.context(m.req) });
+        break;
+      case 'suggest':
+        send({ type: 'suggest', reqId: m.reqId, result: store.suggest(m.req) });
+        break;
     }
   } catch (e) {
     send({ type: 'error', reqId: 'reqId' in m ? m.reqId : undefined, message: e instanceof Error ? e.stack || e.message : String(e) });

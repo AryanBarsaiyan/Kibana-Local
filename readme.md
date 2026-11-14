@@ -13,7 +13,12 @@ Kibana-style Discover view for local **JSON-lines (LDJSON / NDJSON / JSONL)** lo
   - `message:"gateway timeout"` (phrase) · `level:(ERROR or WARN)`
   - `latency > 500` · `@timestamp >= 2026-11-13T10:00`
   - `and` / `or` / `not` / parentheses; bare words = free text over all values
-- **Histogram** (click a bar to zoom), time ranges, **field sidebar** with top values and ⊕/⊖ filters, column picker, expandable doc view (Table / JSON).
+- **Autocomplete** in the search box: field names (every field in the selected indexes), operators, values with counts (from the newest 50k lines in the current time range; prefix matches first), `and`/`or`/`not`, value groups and recent queries. `↑/↓` select, `Tab`/`Enter` accept, `Esc` close; `Enter` with nothing selected just searches. The filter editor suggests values too.
+- **Highlighting**: search terms and filter values are highlighted in the results grid and the expanded document (Table and JSON).
+- **Filter pills** (like Kibana's filter bar): ⊕/⊖/∃ add a pill instead of editing the query. Click a pill to edit it, exclude or include results, or disable it temporarily; ☰ enables, disables, inverts or removes all of them. **+ Add filter** supports *is / is not*, *is one of*, *is between* (numbers or dates), *exists* and custom KQL. Filters are saved with the workspace.
+- **Sorting**: click a column header to sort by it (ascending → descending → back to newest first); Shift-click adds secondary sort keys. Numbers and numeric strings sort numerically; missing values go last.
+- **Surrounding documents**: in an expanded entry, **View surrounding documents** shows the lines logged just before and after it, with *Load N newer / older* and an *Only this file* option. Filters apply; the query and time range do not. `Esc` goes back.
+- **Histogram** (click a bar to zoom), time ranges, **field sidebar** with top values, column picker, expandable doc view (Table / JSON).
 - Auto-detects timestamp / level / message fields (override in settings). Non-JSON lines are kept; indented lines (stack traces) attach to the previous entry.
 
 - **Mixed schemas**: timestamp/level/message are detected per index, and the default *level* / *message* columns resolve per row — so `level` vs `severity`, `message` vs `text` line up in one view.

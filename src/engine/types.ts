@@ -38,10 +38,93 @@ export type TimeRange =
   | { kind: 'relative'; ms: number }
   | { kind: 'absolute'; from: number; to: number };
 
+/**
+ * A filter pill (Kibana filter bar). Combined with the query using AND.
+ *   is          field equals value (case-insensitive for strings)
+ *   is_one_of   field equals any of values
+ *   between     gte <= field <= lte (numbers or dates; either bound optional)
+ *   exists      field is present and not empty
+ *   query       a KQL expression, for filters that do not fit the forms above
+ */
+export interface Filter {
+  field: string;
+  op: 'is' | 'is_one_of' | 'between' | 'exists' | 'query';
+  value?: Primitive;
+  values?: Primitive[];
+  gte?: string;
+  lte?: string;
+  query?: string;
+  negate: boolean;
+  disabled: boolean;
+  label?: string;
+}
+
+/** Sort keys apply in order; ties fall back to newest first. `@timestamp` sorts by each row's detected time. */
+export interface SortSpec {
+  field: string;
+  dir: 'asc' | 'desc';
+}
+
 export interface QueryRequest {
   q: string;
   indexes: string[];
   range: TimeRange;
+  filters?: Filter[];
+  sort?: SortSpec[];
+}
+
+/**
+ * A search term to highlight in results. `field` null = free text (any field).
+ *   word      whole-word match (case-insensitive)
+ *   phrase    substring match (case-insensitive)
+ *   wildcard  `*` pattern; anchored to the whole value when `field` is set
+ *   exact     the whole value equals `value` (filter pills)
+ */
+export interface HighlightTerm {
+  field: string | null;
+  value: string;
+  mode: 'word' | 'phrase' | 'wildcard' | 'exact';
+}
+
+export interface SuggestRequest {
+  field: string;
+  /** typed so far; values starting with it rank first, then values containing it */
+  prefix: string;
+  indexes: string[];
+  range: TimeRange;
+}
+
+export interface SuggestResult {
+  values: { v: string; c: number }[];
+  /** rows looked at */
+  sampled: number;
+  /** the field is a time field: values are minutes, newest first */
+  time: boolean;
+}
+
+export interface ContextRequest {
+  /** hit id of the anchor document */
+  id: number;
+  /** number of newer documents to return */
+  newer: number;
+  /** number of older documents to return */
+  older: number;
+  indexes: string[];
+  filters?: Filter[];
+  /** only documents from the anchor's own file */
+  sameFile: boolean;
+}
+
+export interface ContextResult {
+  anchor: Hit | null;
+  /** newest first, all newer than the anchor */
+  newer: Hit[];
+  /** newest first, all older than the anchor */
+  older: Hit[];
+  /** more documents exist beyond each end */
+  moreNewer: boolean;
+  moreOlder: boolean;
+  error?: string;
 }
 
 export interface FieldStat {
@@ -78,6 +161,10 @@ export interface QueryResult {
   memoryBytes: number;
   /** retained rows per index (the row limit applies to each) */
   indexRows: Record<string, number>;
+  /** search terms to highlight in the results */
+  highlight: HighlightTerm[];
+  /** every field name seen in the selected indexes, regardless of hits (for autocomplete) */
+  fieldNames: string[];
   error?: string;
 }
 

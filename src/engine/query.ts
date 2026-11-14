@@ -10,7 +10,7 @@
  *   "connection reset"          free-text phrase
  *   a and b, a or b, not a, (a or b) and c, implicit AND between terms
  */
-import { Primitive, Row } from './types';
+import { Filter, HighlightTerm, Primitive, Row } from './types';
 import { parseTimestamp } from './parse';
 
 type Tok =
@@ -66,7 +66,7 @@ function wildcardRe(v: string, anchored: boolean): RegExp {
 
 export interface QueryContext { tsFieldOf: (index: string) => string | null }
 
-function getField(r: Row, f: string, ctx: QueryContext): Primitive | undefined {
+export function getField(r: Row, f: string, ctx: QueryContext): Primitive | undefined {
   if (f === '_index') return r.index;
   if (f === '_file') return r.file;
   if (f === '@timestamp' && !(f in r.flat)) {
@@ -114,9 +114,17 @@ function compare(op: string, field: string, rawVal: string, ctx: QueryContext): 
   };
 }
 
-export function compileQuery(src: string, ctx: QueryContext): Pred {
+/**
+ * @param collect when given, receives the terms a matching row is expected to contain
+ *   (for highlighting). Terms under an odd number of `not`s are left out.
+ */
+export function compileQuery(src: string, ctx: QueryContext, collect?: HighlightTerm[]): Pred {
   const toks = tokenize(src);
   let p = 0;
+  let neg = 0;
+  const hl = (field: string | null, value: string, mode: HighlightTerm['mode']) => {
+    if (collect && neg % 2 === 0 && value !== '' && field !== '@timestamp') collect.push({ field, value, mode });
+  };
   const peek = () => toks[p];
   const isKw = (tk: Tok | undefined, kw: string) => !!tk && tk.t === 'word' && tk.v.toLowerCase() === kw;
 
@@ -136,7 +144,7 @@ export function compileQuery(src: string, ctx: QueryContext): Pred {
     return parts.length === 1 ? parts[0] : (r) => parts.every((f) => f(r));
   }
   function parseNot(): Pred {
-    if (isKw(peek(), 'not')) { p++; const inner = parseNot(); return (r) => !inner(r); }
+    if (isKw(peek(), 'not')) { p++; neg++; const inner = parseNot(); neg--; return (r) => !inner(r); }
     return parsePrimary();
   }
   function parseValueGroup(field: string): Pred {
@@ -154,6 +162,7 @@ export function compileQuery(src: string, ctx: QueryContext): Pred {
       }
       if (tk.t !== 'word' && tk.t !== 'str') throw new QueryError(`Unexpected token in value group for ${field}`);
       ms.push({ m: valueMatcher(tk.v, tk.t === 'str'), neg: false });
+      hlValue(field, tk.v, tk.t === 'str');
     }
     if (!peek()) throw new QueryError('Missing )');
     p++;
@@ -163,7 +172,12 @@ export function compileQuery(src: string, ctx: QueryContext): Pred {
       return mode === 'and' ? res.every(Boolean) : res.some(Boolean);
     };
   }
+  function hlValue(field: string, val: string, quoted: boolean) {
+    if (!quoted && val === '*') return;
+    hl(field, val, quoted ? 'phrase' : val.includes('*') ? 'wildcard' : 'word');
+  }
   function fieldPred(field: string, val: string, quoted: boolean): Pred {
+    hlValue(field, val, quoted);
     const m = valueMatcher(val, quoted);
     return (r) => m(getField(r, field, ctx));
   }
@@ -180,6 +194,7 @@ export function compileQuery(src: string, ctx: QueryContext): Pred {
     if (tk.t === 'op') throw new QueryError(`Unexpected ${tk.v}`);
     if (tk.t === 'str') {
       const lower = tk.v.toLowerCase();
+      hl(null, tk.v, 'phrase');
       return (r) => r.lower.includes(lower);
     }
     // word
@@ -215,9 +230,11 @@ export function compileQuery(src: string, ctx: QueryContext): Pred {
     // free text word
     if (w.includes('*')) {
       const re = wildcardRe(w, false);
+      if (w.replace(/\*/g, '')) hl(null, w, 'wildcard');
       return (r) => re.test(r.lower);
     }
     const lower = w.toLowerCase();
+    hl(null, w, 'phrase');
     return (r) => r.lower.includes(lower);
   }
 
@@ -225,4 +242,71 @@ export function compileQuery(src: string, ctx: QueryContext): Pred {
   const pred = parseOr();
   if (p < toks.length) throw new QueryError(`Unexpected token near "${JSON.stringify(toks[p])}"`);
   return pred;
+}
+
+/** Exact value match (strings case-insensitive), as used by filter pills. */
+function equalsMatcher(value: Primitive | undefined): (v: Primitive | undefined) => boolean {
+  if (value === null) return (v) => v === null;
+  const want = String(value).toLowerCase();
+  return (v) => v !== undefined && v !== null && String(v).toLowerCase() === want;
+}
+
+function filterPred(f: Filter, ctx: QueryContext): Pred {
+  if (f.op === 'query') {
+    try {
+      return compileQuery(f.query || '', ctx);
+    } catch (e) {
+      throw new QueryError(`Filter "${f.label || f.query}": ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  const field = f.field;
+  if (!field || !FIELD_RE.test(field)) throw new QueryError(`Filter has an invalid field name: "${field ?? ''}"`);
+  switch (f.op) {
+    case 'is': {
+      const m = equalsMatcher(f.value);
+      return (r) => m(getField(r, field, ctx));
+    }
+    case 'is_one_of': {
+      const ms = (f.values ?? []).map(equalsMatcher);
+      if (!ms.length) throw new QueryError(`Filter on ${field} needs at least one value`);
+      return (r) => { const v = getField(r, field, ctx); return ms.some((m) => m(v)); };
+    }
+    case 'between': {
+      const gte = (f.gte ?? '').trim(), lte = (f.lte ?? '').trim();
+      if (!gte && !lte) throw new QueryError(`Filter on ${field} needs a start or an end value`);
+      const lo = gte ? compare('>=', field, gte, ctx) : null;
+      const hi = lte ? compare('<=', field, lte, ctx) : null;
+      return (r) => (!lo || lo(r)) && (!hi || hi(r));
+    }
+    case 'exists': {
+      const m = valueMatcher('*', false);
+      return (r) => m(getField(r, field, ctx));
+    }
+    default:
+      throw new QueryError(`Unknown filter operator: ${String((f as Filter).op)}`);
+  }
+}
+
+/** Terms to highlight for the enabled, non-negated filters. */
+export function filterHighlights(filters: Filter[] | undefined, ctx: QueryContext): HighlightTerm[] {
+  const out: HighlightTerm[] = [];
+  for (const f of filters ?? []) {
+    if (!f || f.disabled || f.negate) continue;
+    if (f.op === 'is' && f.value !== null && f.value !== undefined) out.push({ field: f.field, value: String(f.value), mode: 'exact' });
+    else if (f.op === 'is_one_of') for (const v of f.values ?? []) { if (v !== null) out.push({ field: f.field, value: String(v), mode: 'exact' }); }
+    else if (f.op === 'query') { try { compileQuery(f.query || '', ctx, out); } catch { /* reported by compileFilters */ } }
+  }
+  return out.filter((t) => t.field !== '@timestamp');
+}
+
+/** AND of every enabled filter; negated filters exclude their matches. */
+export function compileFilters(filters: Filter[] | undefined, ctx: QueryContext): Pred | null {
+  const preds: Pred[] = [];
+  for (const f of filters ?? []) {
+    if (!f || f.disabled) continue;
+    const p = filterPred(f, ctx);
+    preds.push(f.negate ? (r) => !p(r) : p);
+  }
+  if (!preds.length) return null;
+  return preds.length === 1 ? preds[0] : (r) => preds.every((p) => p(r));
 }

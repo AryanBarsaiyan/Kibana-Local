@@ -1,6 +1,6 @@
 import { Worker } from 'worker_threads';
 import { FromWorker, ToWorker } from './protocol';
-import { DetectedFields, Hit, QueryRequest, QueryResult, StoreLimits } from './types';
+import { ContextRequest, ContextResult, DetectedFields, Hit, QueryRequest, QueryResult, StoreLimits, SuggestRequest, SuggestResult } from './types';
 
 type DistributiveOmit<T, K extends keyof any> = T extends unknown ? Omit<T, K> : never;
 type Pending = { resolve: (v: any) => void; reject: (e: Error) => void };
@@ -20,7 +20,7 @@ export class WorkerClient {
         else this.onError(m.message);
         return;
       }
-      this.settle(m.reqId, m.type === 'result' ? m.result : m.hits);
+      this.settle(m.reqId, m.type === 'page' ? m.hits : m.result);
     });
     this.w.on('error', (e) => this.onError(e.stack || e.message));
     this.post({ type: 'init', limits, overrides });
@@ -50,6 +50,8 @@ export class WorkerClient {
   query(req: QueryRequest) { return this.request<QueryResult>({ type: 'query', req }); }
   tick() { return this.request<QueryResult | null>({ type: 'tick' }); }
   page(offset: number, count: number) { return this.request<Hit[]>({ type: 'page', offset, count }); }
+  context(req: ContextRequest) { return this.request<ContextResult>({ type: 'context', req }); }
+  suggest(req: SuggestRequest) { return this.request<SuggestResult>({ type: 'suggest', req }); }
 
   dispose() {
     for (const p of this.pending.values()) p.reject(new Error('disposed'));

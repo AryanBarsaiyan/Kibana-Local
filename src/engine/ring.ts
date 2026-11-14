@@ -27,6 +27,14 @@ export class RowBuffer {
     for (const r of this.a) if (!r.dead) fn(r);
   }
 
+  /** newest arrivals first; stops when fn returns false */
+  forEachNewest(fn: (r: Row) => boolean) {
+    for (let i = this.a.length - 1; i >= 0; i--) {
+      const r = this.a[i];
+      if (!r.dead && !fn(r)) return;
+    }
+  }
+
   /** keep only rows matching pred; returns removed rows (flagged dead) */
   retain(pred: (r: Row) => boolean): Row[] {
     const kept: Row[] = [], removed: Row[] = [];

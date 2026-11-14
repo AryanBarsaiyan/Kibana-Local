@@ -1,6 +1,13 @@
 
 # Changelog
 
+## Unreleased
+- **Autocomplete** for the search box, like Kibana's KQL bar: suggests field names, operators (comparisons first for numeric and time fields), values with counts, `and` / `or` / `not`, `)` inside value groups, and recent queries (saved per workspace, with "clear recent"). Values come from the worker: the newest 50k lines of the selected indexes within the time range, prefix matches before substring matches; time fields suggest minutes in query format. Typing `:` after an accepted `field ` joins it to the field. The filter editor's Value box suggests values as well.
+- **Search-term highlighting** in result cells and the expanded document (Table and JSON): free text and phrases anywhere, `field:value` terms only in that field, wildcards, and the values of enabled filter pills. Negated terms are not highlighted.
+- **Filter pills**: ⊕ / ⊖ / ∃ now add Kibana-style filters to a filter bar instead of rewriting the search query. Each pill can be edited, excluded/included or temporarily disabled; a ☰ menu acts on all of them. **+ Add filter** offers *is*, *is not*, *is one of*, *is between*, *exists*, *does not exist* and custom KQL, with an optional label. Filters match exact values (case-insensitive) and are saved per workspace.
+- **Column sorting**: click a header (Time, _index, or any field column) to sort; Shift-click adds secondary sort keys. Sorting runs in the worker; live updates keep the chosen order. "reset to newest first" restores the default.
+- **Surrounding documents**: from an expanded entry, view its neighbours in time (5 each side by default) with load-more in both directions, an *Only this file* toggle, and re-anchoring on any neighbour. Filters apply; the query and time range do not.
+
 ## 0.4.0
 - Renamed to **KibanaLocal** (display name, sidebar, tab and command titles). The extension ID and all `logscope.*` settings are unchanged, so existing settings and saved indexes keep working.
 - Activity Bar icon with an **Indexes** sidebar: welcome buttons, inline **Reload** / **Remove** per index, **Open Log File** / **Reveal in File Explorer**, and a **Settings** button.

@@ -1,9 +1,10 @@
 import * as path from 'path';
 import { detectFields, flatten, parseLine, parseTimestamp } from './parse';
-import { compileQuery, Pred, QueryError } from './query';
+import { compileFilters, compileQuery, filterHighlights, getField, Pred, QueryContext, QueryError } from './query';
 import { EvictionOrder, RowBuffer } from './ring';
 import {
-  DetectedFields, FieldStat, Hit, PAGE_SIZE, Primitive, QueryRequest, QueryResult, Row, StoreLimits,
+  ContextRequest, ContextResult, DetectedFields, FieldStat, Filter, HighlightTerm, Hit, PAGE_SIZE, Primitive, QueryRequest,
+  QueryResult, Row, SortSpec, StoreLimits, SuggestRequest, SuggestResult,
 } from './types';
 
 const LEADING_TS = /^\[?(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d| UTC)?)\]?/;
@@ -16,6 +17,16 @@ const CONTINUATION = /^(\s|at\s|Caused by|\.\.\.|CallStack)/;
 const EXCEPTION_HEADER = /^(?:Exception in thread "|(?:[a-z_$][\w$]*\.)+[A-Z][\w$]*(?:Exception|Error|Throwable)(?::|\s*$))/;
 const DETECT_SAMPLES = 300;
 const STATS_SAMPLE = 10000;
+/** rows scanned (newest first) for value suggestions */
+const SUGGEST_SAMPLE = 50000;
+const SUGGEST_LIMIT = 10;
+
+const pad2 = (n: number) => String(n).padStart(2, '0');
+/** local time to the minute, in the form the query language accepts: 2026-11-13T10:05 */
+function localMinute(t: number): string {
+  const d = new Date(t);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
 
 /** Free-text search runs over field values only (like Kibana), not JSON keys/punctuation. */
 function valuesText(flat: Record<string, Primitive>): string {
@@ -45,7 +56,36 @@ function cmp(a: Row, b: Row): number {
   return b.id - a.id;
 }
 
-function merge(a: Row[], b: Row[]): Row[] {
+type Cmp = (a: Row, b: Row) => number;
+
+type SortKey = number | string | undefined;
+
+/** Normalised sort value: missing → undefined, numbers and numeric strings → number, anything else → string. */
+function sortKey(v: Primitive | undefined): SortKey {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    if (!isNaN(n)) return n;
+  }
+  return String(v);
+}
+
+/** Missing values last in either direction; numbers numerically; otherwise by string. */
+function compareKeys(a: SortKey, b: SortKey, sign: number): number {
+  if (a === undefined || b === undefined) return a === b ? 0 : a === undefined ? 1 : -1;
+  let c: number;
+  if (typeof a === 'number' && typeof b === 'number') c = a - b;
+  else {
+    const sa = String(a), sb = String(b);
+    c = sa < sb ? -1 : sa > sb ? 1 : 0;
+  }
+  return c * sign;
+}
+
+const isDefaultSort = (sort: SortSpec[]) => !sort.length || (sort.length === 1 && sort[0].field === '@timestamp' && sort[0].dir === 'desc');
+
+function merge(a: Row[], b: Row[], cmp: Cmp): Row[] {
   const out = new Array<Row>(a.length + b.length);
   let i = 0, j = 0, k = 0;
   while (i < a.length && j < b.length) out[k++] = cmp(a[i], b[j]) <= 0 ? a[i++] : b[j++];
@@ -64,6 +104,10 @@ interface Session {
   req: QueryRequest;
   pred: Pred;
   matched: Row[];
+  cmp: Cmp;
+  /** newest first by time: rows that age out of a sliding range sit at the end */
+  timeDesc: boolean;
+  highlight: HighlightTerm[];
 }
 
 interface Bounds { idxSet: Set<string> | null; from: number; to: number; timed: boolean }
@@ -75,6 +119,8 @@ export class LogStore {
   private nextId = 1;
   private lastByFile = new Map<string, Row>();
   private indexes = new Map<string, IndexState>();
+  /** field names seen per index (capped), for autocomplete */
+  private names = new Map<string, Set<string>>();
   private bytes = 0;
 
   private session: Session | null = null;
@@ -137,6 +183,7 @@ export class LogStore {
       const obj = parseLine(line);
       if (obj) {
         const flat = flatten(obj);
+        this.noteNames(index, flat);
         if (!st.locked) {
           st.samples.push(flat);
           const n = st.samples.length;
@@ -172,6 +219,7 @@ export class LogStore {
       }
       const m = LEADING_TS.exec(line);
       const flat = { message: line };
+      this.noteNames(index, flat);
       const lower = line.toLowerCase() + '\n';
       this.add({
         id: this.nextId++, index, file, fileKey,
@@ -180,6 +228,20 @@ export class LogStore {
       });
     }
     this.enforce();
+  }
+
+  private noteNames(index: string, flat: Record<string, Primitive>) {
+    let set = this.names.get(index);
+    if (!set) { set = new Set(); this.names.set(index, set); }
+    if (set.size >= 2000) return;
+    for (const k in flat) set.add(k);
+  }
+
+  /** field names across the given indexes (all when empty), sorted */
+  fieldNames(indexes: string[] = []): string[] {
+    const out = new Set<string>();
+    for (const [name, set] of this.names) if (!indexes.length || indexes.includes(name)) for (const k of set) out.add(k);
+    return [...out].sort();
   }
 
   private add(row: Row) {
@@ -235,6 +297,7 @@ export class LogStore {
     this.order.dropWhere((k) => k.startsWith(index + '\u0000'));
     for (const k of [...this.lastByFile.keys()]) if (k.startsWith(index + '\u0000')) this.lastByFile.delete(k);
     this.indexes.delete(index);
+    this.names.delete(index);
     this.dirty = true;
   }
 
@@ -252,12 +315,73 @@ export class LogStore {
     return pred(r);
   }
 
+  private qctx(): QueryContext {
+    return { tsFieldOf: (i) => this.detectedFor(i).ts };
+  }
+
+  /** query AND every enabled filter */
+  private compile(q: string, filters: Filter[] | undefined, highlight?: HighlightTerm[]): Pred {
+    const ctx = this.qctx();
+    const qp = compileQuery(q || '', ctx, highlight);
+    if (highlight) highlight.push(...filterHighlights(filters, ctx));
+    const fp = compileFilters(filters, ctx);
+    return fp ? (r) => fp(r) && qp(r) : qp;
+  }
+
+  /** value a sort key reads from a row; virtual `_level` / `_message` resolve per index */
+  private sortGetter(field: string): (r: Row) => Primitive | undefined {
+    const ctx = this.qctx();
+    if (field === '@timestamp') return (r) => r.ts;
+    if (field === '_level') return (r) => { const f = this.detectedFor(r.index).level; return f ? r.flat[f] : undefined; };
+    if (field === '_message') return (r) => { const f = this.detectedFor(r.index).msg; return f ? r.flat[f] : undefined; };
+    return (r) => (field === this.detectedFor(r.index).ts ? r.ts : getField(r, field, ctx));
+  }
+
+  private sortKeys(sort: SortSpec[]) {
+    return sort.map((k) => ({ get: this.sortGetter(k.field), sign: k.dir === 'asc' ? 1 : -1 }));
+  }
+
+  /** row comparator for a sort spec; used for incremental merges (few rows) */
+  private makeCmp(sort: SortSpec[]): Cmp {
+    if (isDefaultSort(sort)) return cmp;
+    const keys = this.sortKeys(sort);
+    return (a, b) => {
+      for (const k of keys) {
+        const c = compareKeys(sortKey(k.get(a)), sortKey(k.get(b)), k.sign);
+        if (c) return c;
+      }
+      return cmp(a, b);
+    };
+  }
+
+  /** full sort: same order as makeCmp, but each row's keys are read once (decorate-sort-undecorate) */
+  private sortRows(rows: Row[], sort: SortSpec[]): Row[] {
+    if (isDefaultSort(sort)) return rows.sort(cmp);
+    const keys = this.sortKeys(sort);
+    const nk = keys.length;
+    const dec = rows.map((r) => {
+      const k = new Array<SortKey>(nk);
+      for (let i = 0; i < nk; i++) k[i] = sortKey(keys[i].get(r));
+      return { r, k };
+    });
+    dec.sort((a, b) => {
+      for (let i = 0; i < nk; i++) {
+        const c = compareKeys(a.k[i], b.k[i], keys[i].sign);
+        if (c) return c;
+      }
+      return cmp(a.r, b.r);
+    });
+    for (let i = 0; i < dec.length; i++) rows[i] = dec[i].r;
+    return rows;
+  }
+
   /** Full query: scans every retained row and starts a new session. */
   query(req: QueryRequest, now = Date.now()): QueryResult {
     const t0 = Date.now();
     let pred: Pred;
+    const highlight: HighlightTerm[] = [];
     try {
-      pred = compileQuery(req.q || '', { tsFieldOf: (i) => this.detectedFor(i).ts });
+      pred = this.compile(req.q, req.filters, highlight);
     } catch (e) {
       this.session = null;
       this.pendingNew = [];
@@ -267,8 +391,9 @@ export class LogStore {
     const b = this.bounds(req, now);
     const matched: Row[] = [];
     this.buf.forEach((r) => { if (this.accepts(r, b, pred)) matched.push(r); });
-    matched.sort(cmp);
-    this.session = { req, pred, matched };
+    const sort = (req.sort ?? []).filter((k) => k && typeof k.field === 'string' && k.field && k.field !== '_source');
+    this.sortRows(matched, sort);
+    this.session = { req, pred, matched, cmp: this.makeCmp(sort), timeDesc: isDefaultSort(sort), highlight: dedupeTerms(highlight) };
     this.pendingNew = [];
     this.touched.clear();
     this.evicted = false;
@@ -312,18 +437,25 @@ export class LogStore {
     this.touched.clear();
 
     if (b.timed) {
-      if (m === s.matched) m = m.slice();
-      while (m.length && (m[m.length - 1].ts as number) < b.from) m.pop();
+      if (s.timeDesc) {
+        if (m === s.matched) m = m.slice();
+        while (m.length && (m[m.length - 1].ts as number) < b.from) m.pop();
+      } else {
+        // custom sort: rows that slid out of the range can be anywhere
+        const before = m.length;
+        m = m.filter((r) => (r.ts as number) >= b.from);
+        if (m.length !== before) shifted = true;
+      }
     }
 
-    const fresh = [...candidates].filter((r) => this.accepts(r, b, s.pred)).sort(cmp);
+    const fresh = [...candidates].filter((r) => this.accepts(r, b, s.pred)).sort(s.cmp);
     let prepended = 0;
     if (fresh.length) {
-      if (!m.length || cmp(fresh[fresh.length - 1], m[0]) <= 0) {
+      if (!m.length || s.cmp(fresh[fresh.length - 1], m[0]) <= 0) {
         m = fresh.concat(m);
         prepended = fresh.length;
       } else {
-        m = merge(m, fresh);
+        m = merge(m, fresh, s.cmp);
         shifted = true;
       }
     }
@@ -336,10 +468,82 @@ export class LogStore {
     return this.session.matched.slice(offset, offset + count).map(toHit);
   }
 
+  /**
+   * Value suggestions for autocomplete: distinct values of `field` among the newest rows of the
+   * selected indexes inside the time range. Values starting with the prefix rank before values
+   * that merely contain it; then by frequency. Time fields suggest minutes, newest first.
+   */
+  suggest(req: SuggestRequest, now = Date.now()): SuggestResult {
+    const b = this.bounds({ q: '', indexes: req.indexes, range: req.range }, now);
+    const ctx = this.qctx();
+    const field = req.field;
+    const prefix = (req.prefix ?? '').toLowerCase();
+    const counts = new Map<string, number>();
+    let sampled = 0, time = false;
+    this.buf.forEachNewest((r) => {
+      if (b.idxSet && !b.idxSet.has(r.index)) return true;
+      if (b.timed && (r.ts === null || r.ts < b.from || r.ts > b.to)) return true;
+      sampled++;
+      let v: Primitive | undefined;
+      if (field === '@timestamp' || field === this.detectedFor(r.index).ts) {
+        time = true;
+        v = r.ts === null ? undefined : localMinute(r.ts);
+      } else v = getField(r, field, ctx);
+      if (v !== undefined && v !== null && v !== '') {
+        const s = String(v);
+        if (s.length <= 200 && (!prefix || s.toLowerCase().includes(prefix)) && (counts.size < 5000 || counts.has(s))) {
+          counts.set(s, (counts.get(s) ?? 0) + 1);
+        }
+      }
+      return sampled < SUGGEST_SAMPLE;
+    });
+    const rank = (s: string) => (prefix && !s.toLowerCase().startsWith(prefix) ? 1 : 0);
+    const values = [...counts.entries()]
+      .sort((a, b) => rank(a[0]) - rank(b[0]) || (time ? (a[0] < b[0] ? 1 : -1) : b[1] - a[1] || (a[0] < b[0] ? -1 : 1)))
+      .slice(0, SUGGEST_LIMIT)
+      .map(([v, c]) => ({ v, c }));
+    return { values, sampled, time };
+  }
+
+  /**
+   * Surrounding documents (Kibana "View surrounding documents"): the anchor plus its nearest
+   * neighbours in time, from the selected indexes, with the filters applied but not the query.
+   */
+  context(req: ContextRequest): ContextResult {
+    let anchor: Row | null = null;
+    this.buf.forEach((r) => { if (r.id === req.id) anchor = r; });
+    const a = anchor as Row | null;
+    if (!a) return { anchor: null, newer: [], older: [], moreNewer: false, moreOlder: false, error: 'That document is no longer loaded (it was dropped by a limit or its file was reloaded).' };
+    let fp: Pred | null;
+    try {
+      fp = compileFilters(req.filters, this.qctx());
+    } catch (e) {
+      return { anchor: toHit(a), newer: [], older: [], moreNewer: false, moreOlder: false, error: e instanceof Error ? e.message : String(e) };
+    }
+    const idxSet = req.indexes.length ? new Set(req.indexes) : null;
+    const newer: Row[] = [], older: Row[] = [];
+    this.buf.forEach((r) => {
+      if (r === a) return;
+      if (req.sameFile ? r.fileKey !== a.fileKey : idxSet && !idxSet.has(r.index)) return;
+      if (fp && !fp(r)) return;
+      (cmp(r, a) < 0 ? newer : older).push(r);
+    });
+    newer.sort(cmp);
+    older.sort(cmp);
+    const nN = Math.max(0, Math.floor(req.newer)), nO = Math.max(0, Math.floor(req.older));
+    return {
+      anchor: toHit(a),
+      newer: newer.slice(Math.max(0, newer.length - nN)).map(toHit),
+      older: older.slice(0, nO).map(toHit),
+      moreNewer: newer.length > nN,
+      moreOlder: older.length > nO,
+    };
+  }
+
   private emptyResult(error?: string): QueryResult {
     return {
       total: 0, scanned: this.buf.length, hits: [], histogram: null, fields: [], fieldSample: 0, tookMs: 0,
-      reset: true, prepended: 0, detected: this.detectedMap(), memoryBytes: this.bytes, indexRows: this.indexRows(), error,
+      reset: true, prepended: 0, detected: this.detectedMap(), memoryBytes: this.bytes, indexRows: this.indexRows(), highlight: [], fieldNames: this.fieldNames(), error,
     };
   }
 
@@ -358,6 +562,8 @@ export class LogStore {
       detected: this.detectedMap(),
       memoryBytes: this.bytes,
       indexRows: this.indexRows(),
+      highlight: this.session?.highlight ?? [],
+      fieldNames: this.fieldNames(req.indexes),
     };
   }
 
@@ -388,6 +594,16 @@ export class LogStore {
     fields.sort((a, b) => a.name.localeCompare(b.name));
     return { fields: fields.slice(0, 400), sample: n };
   }
+}
+
+function dedupeTerms(terms: HighlightTerm[]): HighlightTerm[] {
+  const seen = new Set<string>();
+  return terms.filter((t) => {
+    const k = `${t.field}\u0000${t.mode}\u0000${t.value.toLowerCase()}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
 
 function toHit(r: Row): Hit {

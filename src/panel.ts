@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { FileTailer, FolderTailer, LOG_EXT, Tailer, TailerEvents } from './engine/tailer';
-import { DetectedFields, IndexSource, PAGE_SIZE, QueryRequest, QueryResult, StoreLimits } from './engine/types';
+import { DetectedFields, Filter, IndexSource, PAGE_SIZE, Primitive, QueryRequest, QueryResult, SortSpec, StoreLimits } from './engine/types';
 import { WorkerClient } from './engine/workerClient';
 
 type Mode = 'live' | 'interval' | 'manual';
@@ -14,9 +14,39 @@ interface UiState {
   range: QueryRequest['range'];
   columns: string[] | null;
   mode: Mode;
+  filters: Filter[];
+  sort: SortSpec[];
+}
+
+const FILTER_OPS = new Set<Filter['op']>(['is', 'is_one_of', 'between', 'exists', 'query']);
+const isPrim = (v: unknown): v is Primitive => v === null || ['string', 'number', 'boolean'].includes(typeof v);
+
+/** Webview input is untrusted: keep only well-formed filters. */
+function cleanFilters(x: unknown): Filter[] {
+  if (!Array.isArray(x)) return [];
+  const out: Filter[] = [];
+  for (const f of x.slice(0, 100)) {
+    if (!f || typeof f !== 'object' || !FILTER_OPS.has(f.op)) continue;
+    const c: Filter = { field: String(f.field ?? ''), op: f.op, negate: !!f.negate, disabled: !!f.disabled };
+    if (typeof f.label === 'string' && f.label.trim()) c.label = f.label.trim();
+    if (f.op === 'is') c.value = isPrim(f.value) ? f.value : String(f.value ?? '');
+    if (f.op === 'is_one_of') c.values = Array.isArray(f.values) ? f.values.filter(isPrim).slice(0, 200) : [];
+    if (f.op === 'between') { c.gte = String(f.gte ?? ''); c.lte = String(f.lte ?? ''); }
+    if (f.op === 'query') c.query = String(f.query ?? '');
+    out.push(c);
+  }
+  return out;
+}
+
+function cleanSort(x: unknown): SortSpec[] {
+  if (!Array.isArray(x)) return [];
+  return x.filter((k) => k && typeof k.field === 'string' && k.field && (k.dir === 'asc' || k.dir === 'desc'))
+    .slice(0, 5).map((k) => ({ field: k.field, dir: k.dir }));
 }
 
 const STATE_KEY = 'logscope.state';
+const HISTORY_KEY = 'logscope.history';
+const HISTORY_MAX = 20;
 export const INDEX_KEY = 'logscope.indexes';
 const LIVE_DEBOUNCE_MS = 300;
 const RELATIVE_SLIDE_MS = 5000;
@@ -81,6 +111,8 @@ export class LogScopePanel {
   private tailers = new Map<string, Tailer>();
   private sources: IndexSource[];
   private ui: UiState;
+  /** recent non-empty queries, newest first */
+  private history: string[];
   private conf = cfg();
 
   private ready = false;
@@ -111,9 +143,12 @@ export class LogScopePanel {
 
     this.sources = ctx.workspaceState.get<IndexSource[]>(INDEX_KEY, []);
     this.ui = {
-      q: '', indexes: [], range: { kind: 'all' }, columns: null, mode: 'live',
+      q: '', indexes: [], range: { kind: 'all' }, columns: null, mode: 'live', filters: [], sort: [],
       ...ctx.workspaceState.get<Partial<UiState>>(STATE_KEY, {}),
     };
+    this.history = ctx.workspaceState.get<string[]>(HISTORY_KEY, []).filter((x) => typeof x === 'string').slice(0, HISTORY_MAX);
+    this.ui.filters = cleanFilters(this.ui.filters);
+    this.ui.sort = cleanSort(this.ui.sort);
     this.ui.indexes = this.ui.indexes.filter((n) => this.sources.some((s) => s.name === n));
 
     this.panel = vscode.window.createWebviewPanel('logscope', 'KibanaLocal', vscode.ViewColumn.Active, {
@@ -277,7 +312,7 @@ export class LogScopePanel {
 
   private runQuery() {
     if (!this.ready) return;
-    const req: QueryRequest = { q: this.ui.q, indexes: this.ui.indexes, range: this.ui.range };
+    const req: QueryRequest = { q: this.ui.q, indexes: this.ui.indexes, range: this.ui.range, filters: this.ui.filters, sort: this.ui.sort };
     void this.enqueue(async () => {
       try {
         const r = await this.engine.query(req);
@@ -315,11 +350,19 @@ export class LogScopePanel {
   private toast(text: string, level: 'info' | 'error') { this.post({ type: 'toast', level, text }); }
 
   private pushState() {
-    this.post({ type: 'state', sources: this.sources, ui: this.ui, intervalSec: this.conf.intervalSec, pageSize: PAGE_SIZE });
+    this.post({ type: 'state', sources: this.sources, ui: this.ui, intervalSec: this.conf.intervalSec, pageSize: PAGE_SIZE, history: this.history });
   }
 
   private pushSettings() {
     this.post({ type: 'settings', values: settingsSnapshot() });
+  }
+
+  /** add a query to the recent-queries list (deduplicated, newest first) */
+  private remember(q: string) {
+    const t = q.trim();
+    if (!t) return;
+    this.history = [t, ...this.history.filter((x) => x !== t)].slice(0, HISTORY_MAX);
+    void this.ctx.workspaceState.update(HISTORY_KEY, this.history);
   }
 
   private persist() {
@@ -340,6 +383,9 @@ export class LogScopePanel {
         this.ui.q = String(m.q ?? '');
         this.ui.indexes = Array.isArray(m.indexes) ? m.indexes : [];
         this.ui.range = m.range ?? { kind: 'all' };
+        if ('filters' in m) this.ui.filters = cleanFilters(m.filters);
+        if ('sort' in m) this.ui.sort = cleanSort(m.sort);
+        this.remember(this.ui.q);
         this.persist();
         this.applyTimers();
         this.runQuery();
@@ -350,6 +396,44 @@ export class LogScopePanel {
           if (seq !== this.resultSeq) return; // a newer result superseded this request
           const hits = await this.engine.page(offset, PAGE_SIZE);
           if (seq === this.resultSeq) this.post({ type: 'page', seq, offset, hits });
+        });
+        break;
+      }
+      case 'suggest': {
+        const req = { field: String(m.field ?? ''), prefix: String(m.prefix ?? ''), indexes: this.ui.indexes, range: this.ui.range };
+        const token = m.token;
+        if (!req.field) break;
+        void this.enqueue(async () => {
+          try {
+            const result = await this.engine.suggest(req);
+            this.post({ type: 'suggest', token, result });
+          } catch {
+            this.post({ type: 'suggest', token, result: { values: [], sampled: 0, time: false } });
+          }
+        });
+        break;
+      }
+      case 'clearHistory':
+        this.history = [];
+        void this.ctx.workspaceState.update(HISTORY_KEY, this.history);
+        break;
+      case 'context': {
+        const req = {
+          id: Number(m.id),
+          newer: Math.min(10000, Math.max(0, Number(m.newer) || 0)),
+          older: Math.min(10000, Math.max(0, Number(m.older) || 0)),
+          indexes: this.ui.indexes,
+          filters: this.ui.filters,
+          sameFile: !!m.sameFile,
+        };
+        const token = m.token;
+        void this.enqueue(async () => {
+          try {
+            const result = await this.engine.context(req);
+            this.post({ type: 'context', token, result });
+          } catch (e) {
+            this.toast(String(e), 'error');
+          }
         });
         break;
       }
