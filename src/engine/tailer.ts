@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { StringDecoder } from 'string_decoder';
 
 export const LOG_EXT = /\.(log|jsonl|ndjson|ldjson|json|txt|out)$/i;
 const SIG_BYTES = 64;
@@ -52,6 +53,11 @@ export interface Tailer {
 export class FileTailer implements Tailer {
   private offset = 0;
   private partial = '';
+  /**
+   * Kept across reads, so a multi-byte UTF-8 character split by a read boundary (a writer mid-line,
+   * or a read error) is completed by the next read instead of becoming U+FFFD.
+   */
+  private decoder = new StringDecoder('utf8');
   private ino: number | null = null;
   private headSig: string | null = null;
   private skipFirstPartial = false;
@@ -122,6 +128,7 @@ export class FileTailer implements Tailer {
   private reset() {
     this.offset = 0;
     this.partial = '';
+    this.decoder = new StringDecoder('utf8');
     this.headSig = null;
     this.skipFirstPartial = false;
   }
@@ -169,11 +176,13 @@ export class FileTailer implements Tailer {
   }
 
   private readRange(end: number) {
-    const startedAtZero = this.offset === 0;
-    const stream = fs.createReadStream(this.file, { start: this.offset, end: end - 1, highWaterMark: 1 << 20 });
+    const start = this.offset;
+    const startedAtZero = start === 0;
+    const stream = fs.createReadStream(this.file, { start, end: end - 1, highWaterMark: 1 << 20 });
     this.stream = stream;
-    // Decode via StringDecoder semantics so multi-byte UTF-8 split across chunks stays intact.
-    stream.setEncoding('utf8');
+    const decoder = this.decoder;
+    /** bytes received so far; every one of them is in `lines`, `buf` or the decoder */
+    let got = 0;
     const max = this.maxLineChars;
     const cut = (l: string) => (l.length > max ? l.slice(0, max) + TRUNCATED_MARK : l);
     let lines: string[] = [];
@@ -192,7 +201,8 @@ export class FileTailer implements Tailer {
     stream.on('close', () => { if (this.stream === stream) this.stream = null; });
     stream.on('data', (chunk) => {
       if (this.disposed) return; // never emit lines after dispose (index removed / reloaded)
-      buf += chunk as string;
+      got += (chunk as Buffer).length;
+      buf += decoder.write(chunk as Buffer);
       const parts = buf.split(/\r?\n/);
       buf = parts.pop() ?? '';
       if (this.skipFirstPartial && parts.length) { parts.shift(); this.skipFirstPartial = false; }
@@ -213,16 +223,25 @@ export class FileTailer implements Tailer {
         }
       }
     });
-    stream.on('error', (e) => { if (this.disposed) return; this.ev.onError(this.file, e); this.finish(); });
-    stream.on('end', () => {
-      if (this.disposed) { this.reading = false; return; }
+    /** commit what was read: batches already handed over must never be read (and sent) again */
+    const settle = () => {
       this.partial = buf;
-      this.offset = end;
-      if (startedAtZero || this.headSig === null) this.headSig = this.readSig(end);
       const wait = flush();
       if (!wait) { this.finish(); return; }
       const done = () => { if (this.disposed) this.reading = false; else this.finish(); };
       wait.then(done, done);
+    };
+    stream.on('error', (e) => {
+      if (this.disposed) { this.reading = false; return; }
+      this.offset = start + got;
+      this.ev.onError(this.file, e);
+      settle();
+    });
+    stream.on('end', () => {
+      if (this.disposed) { this.reading = false; return; }
+      this.offset = end;
+      if (startedAtZero || this.headSig === null) this.headSig = this.readSig(end);
+      settle();
     });
   }
 

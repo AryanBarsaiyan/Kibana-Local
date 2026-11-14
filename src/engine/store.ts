@@ -9,6 +9,8 @@ import {
 } from './types';
 
 const LEADING_TS = /^\[?(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:[.,]\d+)?(?:Z|[+-]\d\d:?\d\d| UTC)?)\]?/;
+/** a stack trace stops growing past this many chars; further lines become rows of their own */
+const MAX_CONTINUED_CHARS = 200_000;
 const CONTINUATION = /^(\s|at\s|Caused by|\.\.\.|CallStack)/;
 /**
  * Unindented first line of a JVM stack trace, e.g. `java.lang.IllegalStateException: cursor closed`,
@@ -145,6 +147,8 @@ export class LogStore {
   private rowsPerIndex = new Map<string, number>();
   private nextId = 1;
   private lastByFile = new Map<string, Row>();
+  /** continuation lines buffered during the current ingest() batch, per row (see applyContinued) */
+  private continued = new Map<Row, { lines: string[]; chars: number }>();
   private indexes = new Map<string, IndexState>();
   /** field names seen per index (capped), for autocomplete */
   private names = new Map<string, Set<string>>();
@@ -218,6 +222,7 @@ export class LogStore {
         this.addPlain(index, file, fileKey, arrival, line);
       }
     }
+    this.applyContinued();
     this.enforce();
   }
 
@@ -248,18 +253,38 @@ export class LogStore {
     }
     // Non-JSON: continuation lines (stack traces) attach to the previous entry of the same file.
     const prev = this.lastByFile.get(fileKey);
-    if (prev && (CONTINUATION.test(line) || EXCEPTION_HEADER.test(line)) && prev.raw.length < 200_000) {
-      prev.raw += '\n' + line;
-      prev.lower += line.toLowerCase() + '\n';
-      const c = own(prev.flat, '_continuation');
-      prev.flat['_continuation'] = (typeof c === 'string' && c ? c + '\n' : '') + line;
-      const extra = line.length * 3 + 8;
-      prev.bytes += extra;
-      this.bytes += extra;
-      this.touched.add(prev);
-      return;
+    if (prev && (CONTINUATION.test(line) || EXCEPTION_HEADER.test(line))) {
+      let p = this.continued.get(prev);
+      if (!p) { p = { lines: [], chars: prev.raw.length }; this.continued.set(prev, p); }
+      if (p.chars < MAX_CONTINUED_CHARS) {
+        p.lines.push(line);
+        p.chars += line.length + 1;
+        return;
+      }
     }
     this.addPlain(index, file, fileKey, arrival, line);
+  }
+
+  /**
+   * Attach the continuation lines buffered by this batch, joining once per row: appending line by
+   * line with `+=` would leave raw/lower/_continuation as ropes costing several times their length.
+   */
+  private applyContinued() {
+    for (const [row, { lines }] of this.continued) {
+      const add = lines.join('\n');
+      const c = own(row.flat, '_continuation');
+      const had = typeof c === 'string' && c !== '';
+      row.raw = [row.raw, add].join('\n');
+      // `lower` ends with '\n' (see encodeRow / addPlain)
+      row.lower = [row.lower, add.toLowerCase(), ''].join('');
+      row.flat['_continuation'] = had ? [c, add].join('\n') : add;
+      // raw, lower and _continuation each grow by add + one newline; a new field also costs its slot
+      const extra = 3 * (add.length + 1) + (had ? 0 : FIELD_BYTES + STR_BYTES);
+      row.bytes += extra;
+      this.bytes += extra;
+      this.touched.add(row);
+    }
+    this.continued.clear();
   }
 
   /** a non-JSON line: the whole line is the message */

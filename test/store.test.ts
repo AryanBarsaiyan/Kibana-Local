@@ -78,6 +78,32 @@ test('stack-trace continuation lines attach and become searchable incrementally'
   assert.equal(s.size, 1);
 });
 
+test('continuation lines across batches: joined text, searchable, memory accounted', () => {
+  const s = new LogStore({ maxRows: 100, maxBytes: 1e9 });
+  s.ingest('x', '/x.log', ['2026-11-13 10:00:00.000 ERROR job failed', 'java.lang.IllegalStateException: Boom', '\tat A.a(A.java:1)']);
+  const before = s.memoryBytes;
+  s.ingest('x', '/x.log', ['\tat B.b(B.java:2)', '\tat C.c(C.java:3)']);
+  assert.equal(s.size, 1);
+  const hit = s.query({ q: '', indexes: [], range: { kind: 'all' } }).hits[0];
+  assert.equal(hit.raw, ['2026-11-13 10:00:00.000 ERROR job failed', 'java.lang.IllegalStateException: Boom', '\tat A.a(A.java:1)', '\tat B.b(B.java:2)', '\tat C.c(C.java:3)'].join('\n'));
+  assert.equal(hit.flat._continuation, ['java.lang.IllegalStateException: Boom', '\tat A.a(A.java:1)', '\tat B.b(B.java:2)', '\tat C.c(C.java:3)'].join('\n'));
+  // the second batch adds "\tat B…\n\tat C…" (+1 newline) to raw, lower and _continuation
+  const added = '\tat B.b(B.java:2)\n\tat C.c(C.java:3)'.length + 1;
+  assert.equal(s.memoryBytes - before, 3 * added);
+  assert.equal(s.query({ q: 'illegalstateexception', indexes: [], range: { kind: 'all' } }).total, 1);
+  assert.equal(s.query({ q: 'C.java', indexes: [], range: { kind: 'all' } }).total, 1);
+});
+
+test('a stack trace stops growing at the size cap', () => {
+  const s = new LogStore({ maxRows: 100_000, maxBytes: 1e9 });
+  const frame = '\tat ' + 'x'.repeat(995);
+  s.ingest('x', '/x.log', ['2026-11-13 10:00:00.000 ERROR boom', ...Array.from({ length: 300 }, () => frame)]);
+  const hits = s.query({ q: '', indexes: [], range: { kind: 'all' } }).hits;
+  assert.ok(s.size > 1, 'frames past the cap become rows of their own');
+  const head = hits.find((h) => h.raw.startsWith('2026'))!;
+  assert.ok(head.raw.length >= 200_000 && head.raw.length < 201_100);
+});
+
 test('unindented JVM exception header joins the preceding log line with its stack trace', () => {
   const s = new LogStore({ maxRows: 100, maxBytes: 1e9 });
   s.ingest('x', '/x.log', [

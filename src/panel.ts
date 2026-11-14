@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { FileTailer, FolderTailer, LOG_EXT, Tailer, TailerEvents } from './engine/tailer';
@@ -32,7 +33,7 @@ export function savedSources(state: vscode.Memento): IndexSource[] {
   return cleanSources(state.get<unknown>(INDEX_KEY, []));
 }
 
-const expandHome = (p: string) => p.replace(/^~(?=$|[\\/])/, process.env.HOME || process.env.USERPROFILE || '~');
+const expandHome = (p: string) => p.replace(/^~(?=$|[\\/])/, () => os.homedir());
 const RELATIVE_SLIDE_MS = 5000;
 
 /** Settings editable from the in-panel settings form (key -> minimum for numbers, null for strings). */
@@ -89,6 +90,8 @@ export class KibanaLocalPanel {
   private static readonly sourcesChanged = new vscode.EventEmitter<void>();
   /** fires after the saved index list changes (used by the sidebar) */
   static readonly onDidChangeSources = KibanaLocalPanel.sourcesChanged.event;
+  /** release class-level resources (called on deactivate) */
+  static disposeStatics() { KibanaLocalPanel.sourcesChanged.dispose(); }
 
   private panel: vscode.WebviewPanel;
   private engine: WorkerClient;
@@ -150,7 +153,9 @@ export class KibanaLocalPanel {
     this.panel.iconPath = vscode.Uri.joinPath(ctx.extensionUri, 'media', 'icon.png');
     this.panel.webview.html = this.html();
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-    this.panel.webview.onDidReceiveMessage((m) => this.onMessage(m), null, this.disposables);
+    this.panel.webview.onDidReceiveMessage((m) => {
+      this.onMessage(m).catch((e: unknown) => this.toast(e instanceof Error ? e.message : String(e), 'error'));
+    }, null, this.disposables);
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration('logscope')) return;
       this.conf = cfg();

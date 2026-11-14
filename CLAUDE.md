@@ -5,7 +5,7 @@ Kibana-style search, histogram and field explorer for local JSON-lines (LDJSON/N
 ## Commands
 
 - `npm run build` / `npm run watch` — esbuild bundles `src/extension.ts`, `src/engine/worker.ts` (Node) and `webview/main.js` (browser IIFE → `dist/webview.js`) into `dist/`
-- `npm run typecheck` — `tsc` (strict, `noUnusedLocals/Parameters`, no emit)
+- `npm run typecheck` — `tsc` (strict, `noUnusedLocals/Parameters`, no emit), then `tsc -p tsconfig.webview.json` (`checkJs` over `webview/*.js`, non-strict; ambient globals in `webview/globals.d.ts` — use JSDoc casts like `/** @type {HTMLInputElement} */ (el)` where DOM types are too wide)
 - `npm run lint` — eslint
 - `npm test` — compiles `src/engine`, `src/sanitize.ts`, `webview/lib` + `test` to `out-test/` and runs `node --test` (with `--expose-gc` for memory tests)
 - `npm run samples` / `npm run samples:live` — generate sample logs into `samples/data/` (gitignored) / append live lines for tail testing

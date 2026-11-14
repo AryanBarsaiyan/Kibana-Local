@@ -4,7 +4,7 @@ import { esc, fmtBytes, fmtShort, fmtTs, levelClass, own, showVal, toLocalInput 
 import { compileHl, highlight } from './lib/highlight';
 import { effSort, indexAt as indexAtRows, topOf as topOfRows } from './lib/grid';
 import { spacer, vp } from './layout';
-import { VIRTUAL, clickSort, columns, gridTemplate, isMsgCol, resolveCol, showIndexCol, showTime, sortLabel, toggleColumn } from './columns';
+import { clickSort, colLabel, columns, gridTemplate, isMsgCol, resolveCol, showIndexCol, showTime, sortLabel, toggleColumn } from './columns';
 import { search, sendQuery } from './query';
 import { addFilter, renderFilters } from './filters';
 import { ctxHits, openContext } from './context';
@@ -110,7 +110,7 @@ export function headCells(sortable) {
   for (const c of columns()) {
     if (c === '_source') { cells.push('<div role="columnheader">_source</div>'); continue; }
     const rm = sortable ? ` <button class="rmcol" data-rmcol="${esc(c)}" aria-label="Remove column ${esc(c)}">×</button>` : '';
-    cells.push(cell(c, VIRTUAL[c] || c, rm));
+    cells.push(cell(c, colLabel(c), rm));
   }
   return cells.join('');
 }

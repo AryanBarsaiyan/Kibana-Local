@@ -52,4 +52,5 @@ export function activate(ctx: vscode.ExtensionContext) {
 
 export function deactivate() {
   KibanaLocalPanel.current?.dispose();
+  KibanaLocalPanel.disposeStatics();
 }

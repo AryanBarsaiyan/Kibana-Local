@@ -51,7 +51,9 @@ export const S = {
   settings: null,
 };
 
-export const det = (index) => own(S.detected, index) || { ts: null, level: null, msg: null };
+/** @typedef {{ ts: string | null, level: string | null, msg: string | null }} Detected */
+/** detected ts/level/msg field names of an index */
+export const det = (index) => /** @type {Detected} */ (own(S.detected, index) || { ts: null, level: null, msg: null });
 export const activeIndexes = () => (S.ui.indexes.length ? S.ui.indexes : S.sources.map((s) => s.name));
 
 export function knownFields() {

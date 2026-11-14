@@ -3,6 +3,7 @@
 import { $, S, vscode } from './state';
 import { esc, fmtBytes } from './lib/format';
 
+/** @type {[key: string, label: string, unit: string, min: number | null, help: string][]} */
 export const SETTINGS = [
   ['initialTailMB', 'Initial load per file', 'MB', 1, 'Only the last N MB of each file is read when it is first loaded. Applies when indexes are (re)loaded.'],
   ['maxMemoryMB', 'Memory budget', 'MB', 32, 'Shared by all indexes. Over budget, the oldest lines by timestamp are dropped first. Lowering it frees memory right away.'],
@@ -13,7 +14,7 @@ export const SETTINGS = [
   ['levelField', 'Level field', '', null, 'Leave empty to auto-detect.'],
   ['messageField', 'Message field', '', null, 'Leave empty to auto-detect.'],
 ];
-export const setInputs = () => [...document.querySelectorAll('#setFields input')];
+export const setInputs = () => [.../** @type {NodeListOf<HTMLInputElement>} */ (document.querySelectorAll('#setFields input'))];
 export const readSettingsForm = () => {
   const out = {};
   for (const el of setInputs()) out[el.dataset.key] = el.type === 'number' ? Number(el.value) : el.value.trim();

@@ -168,7 +168,7 @@ export function initFilters() {
     items[(i + (e.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length].focus();
   });
   document.addEventListener('mousedown', (e) => {
-    if (!$('#pop').contains(e.target) && !e.target.closest('[data-pill], #filtersMenu, #addFilterBtn')) closePop(false);
+    if (!$('#pop').contains(e.target) && !/** @type {Element} */ (e.target).closest('[data-pill], #filtersMenu, #addFilterBtn')) closePop(false);
   });
   window.addEventListener('resize', () => closePop(false));
 }

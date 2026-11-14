@@ -259,7 +259,7 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "typecheck": "tsc -p .",
+    "typecheck": "tsc -p . && tsc -p tsconfig.webview.json",
     "lint": "eslint .",
     "test": "tsc -p tsconfig.test.json && node --expose-gc --test \"out-test/test/*.test.js\"",
     "vscode:prepublish": "npm run typecheck && node esbuild.mjs --production",

@@ -9,7 +9,10 @@ import { sendQuery } from './query';
 import { renderFields, renderHeader, renderRows } from './grid';
 import { renderContext } from './context';
 
-export const VIRTUAL = { _level: 'level', _message: 'message' };
+// A Map, not an object literal: a field named `constructor` must not resolve to Object.prototype.
+const VIRTUAL = new Map([['_level', 'level'], ['_message', 'message']]);
+/** header label for a column: virtual columns get their display name, real fields their own */
+export const colLabel = (c) => VIRTUAL.get(c) ?? c;
 export const resolveCol = (h, c) => (c === '_level' ? det(h.index).level : c === '_message' ? det(h.index).msg : c);
 export function defaultColumns() {
   const idx = activeIndexes();
@@ -50,7 +53,7 @@ export function gridTemplate() {
 }
 
 // ---------- sorting ----------
-export const sortLabel = (f) => (f === '@timestamp' ? 'Time' : VIRTUAL[f] || f);
+export const sortLabel = (f) => (f === '@timestamp' ? 'Time' : colLabel(f));
 /** click: sort by this column alone (asc → desc → default); Shift-click: add or cycle it as a further sort key */
 export function clickSort(field, add) {
   S.ui.sort = nextSort(S.ui.sort, field, add);

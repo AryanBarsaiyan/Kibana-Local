@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'fs';
+import realFs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { FileTailer, FolderTailer, isInside, TailerEvents, TRUNCATED_MARK } from '../src/engine/tailer';
@@ -208,6 +209,33 @@ test('folder index follows symlinks inside the folder only', async (tt) => {
   await settle(t);
   t.dispose();
   assert.deepEqual(got.sort(), ['{"from":"inside"}', '{"from":"inside"}']);
+});
+
+test('a read error mid-file neither duplicates nor drops lines', async (tt) => {
+  const { dir, got, events, ev } = harness();
+  const f = path.join(dir, 'a.log');
+  // ~2.5 MB: the first 1 MiB chunk alone exceeds BATCH_LINES, so a batch is handed over before the error
+  const N = 50_000;
+  const lines = Array.from({ length: N }, (_, i) => `{"i":${i},"p":"${'é'.repeat(i % 7)}${'x'.repeat(20)}"}`);
+  fs.writeFileSync(f, lines.join('\n') + '\n');
+  const orig = realFs.createReadStream;
+  let calls = 0;
+  tt.mock.method(realFs, 'createReadStream', (...args: Parameters<typeof orig>) => {
+    const s = orig(...args);
+    if (++calls === 1) {
+      let chunks = 0;
+      s.on('data', () => { if (++chunks === 2) process.nextTick(() => s.destroy(new Error('EIO: simulated'))); });
+    }
+    return s;
+  });
+  const t = new FileTailer(f, ev, 1 << 30);
+  t.start();
+  await settle(t, 600);
+  t.dispose();
+  assert.ok(calls >= 2, 'the tailer read again after the error');
+  assert.deepEqual(events, ['error']);
+  assert.equal(got.length, N);
+  assert.deepEqual(got, lines);
 });
 
 test('isInside', () => {
