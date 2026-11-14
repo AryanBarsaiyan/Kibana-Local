@@ -3,3 +3,5 @@ dist/
 out-test/
 *.vsix
 samples/data/
+graphify-out/
+.claude/settings.local.json

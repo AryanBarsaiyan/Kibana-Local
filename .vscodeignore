@@ -12,3 +12,4 @@ dist/**/*.map
 *.tgz
 .vscode/**
 samples/**
+graphify-out/**
