@@ -1,7 +1,7 @@
 
 # Changelog
 
-## Unreleased
+## 0.5.0
 - **View surrounding documents opens instantly on big indexes**: it now walks outward from the selected line through the time index instead of scanning and sorting every loaded line (~18 ms → ~0.03 ms on 200k lines).
 - Live updates no longer resend the full field-name list (up to 2,000 names per index) and detected fields every refresh; they are sent only when they change.
 - Folder indexes rescan the directory at most once per 250 ms while files are being written, instead of on every write.
