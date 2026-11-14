@@ -1,12 +1,24 @@
 import { DetectedFields, Primitive } from './types';
 
+/**
+ * Store a field as an own data property. A plain `out[key] = v` with key `__proto__` would call
+ * the prototype setter (dropping the field, or swapping the prototype); defineProperty never does.
+ * Plain objects (not Object.create(null)) on purpose: V8 keeps those in fast mode, which the
+ * memory budget is calibrated against. Read fields with {@link own}, never `flat[key]`.
+ */
+export function setField(out: Record<string, Primitive>, key: string, v: Primitive) {
+  if (key === '__proto__') Object.defineProperty(out, key, { value: v, writable: true, enumerable: true, configurable: true });
+  else out[key] = v;
+}
+
+/** Flatten nested objects into dotted keys (keys from untrusted lines are stored via {@link setField}). */
 export function flatten(obj: unknown, prefix = '', out: Record<string, Primitive> = {}, depth = 0): Record<string, Primitive> {
   if (obj === null || typeof obj !== 'object') {
-    out[prefix || 'value'] = obj as Primitive;
+    setField(out, prefix || 'value', obj as Primitive);
     return out;
   }
   if (Array.isArray(obj)) {
-    out[prefix || 'value'] = JSON.stringify(obj);
+    setField(out, prefix || 'value', safeStringify(obj));
     return out;
   }
   for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
@@ -14,12 +26,26 @@ export function flatten(obj: unknown, prefix = '', out: Record<string, Primitive
     if (v !== null && typeof v === 'object' && !Array.isArray(v) && depth < 6) {
       flatten(v, key, out, depth + 1);
     } else if (Array.isArray(v) || (v !== null && typeof v === 'object')) {
-      out[key] = JSON.stringify(v);
+      setField(out, key, safeStringify(v));
     } else {
-      out[key] = v as Primitive;
+      setField(out, key, v as Primitive);
     }
   }
   return out;
+}
+
+/** JSON.stringify recurses; a pathologically deep value must not abort the whole batch. */
+function safeStringify(v: unknown): string {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+/** Own-property lookup on a flattened row: `constructor`, `toString` etc. are not fields. */
+export function own(flat: Record<string, Primitive>, key: string): Primitive | undefined {
+  return Object.prototype.hasOwnProperty.call(flat, key) ? flat[key] : undefined;
 }
 
 /** Parse a line that may be JSON, or JSON with a non-JSON prefix (e.g. "pod | {...}"). */

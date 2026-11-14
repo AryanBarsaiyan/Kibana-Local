@@ -3,9 +3,19 @@ import * as path from 'path';
 
 export const LOG_EXT = /\.(log|jsonl|ndjson|ldjson|json|txt|out)$/i;
 const SIG_BYTES = 64;
+/** Longer lines are cut to this many characters; the rest, up to the next newline, is dropped. */
+export const MAX_LINE_CHARS = 1 << 20;
+export const TRUNCATED_MARK = ' …[line truncated]';
+/** a batch is emitted once it holds this many lines or characters */
+const BATCH_LINES = 20_000;
+const BATCH_CHARS = 8 << 20;
 
 export interface TailerEvents {
-  onLines(file: string, lines: string[]): void;
+  /**
+   * New complete lines. When this returns a promise, the tailer stops reading until it settles
+   * (backpressure from the engine).
+   */
+  onLines(file: string, lines: string[]): void | Promise<unknown>;
   /** file was truncated in place (e.g. `> app.log`) — previous rows are gone */
   onTruncate(file: string): void;
   /** file was replaced by a new one (logrotate rename+create) — previous rows stay as history */
@@ -41,7 +51,7 @@ export class FileTailer implements Tailer {
   private disposed = false;
   private missingReported = false;
 
-  constructor(readonly file: string, private ev: TailerEvents, private initialBytes: number) {}
+  constructor(readonly file: string, private ev: TailerEvents, private initialBytes: number, private maxLineChars = MAX_LINE_CHARS) {}
 
   start() {
     try {
@@ -138,8 +148,21 @@ export class FileTailer implements Tailer {
     this.stream = stream;
     // Decode via StringDecoder semantics so multi-byte UTF-8 split across chunks stays intact.
     stream.setEncoding('utf8');
-    const lines: string[] = [];
+    const max = this.maxLineChars;
+    const cut = (l: string) => (l.length > max ? l.slice(0, max) + TRUNCATED_MARK : l);
+    let lines: string[] = [];
+    let chars = 0;
     let buf = this.partial;
+    const push = (l: string) => { lines.push(l); chars += l.length; };
+    /** hand the batch over; resolves when the consumer is ready for more */
+    const flush = (): Promise<unknown> | undefined => {
+      if (!lines.length) return undefined;
+      const batch = lines;
+      lines = [];
+      chars = 0;
+      const r = this.ev.onLines(this.file, batch);
+      return r instanceof Promise ? r : undefined;
+    };
     stream.on('close', () => { if (this.stream === stream) this.stream = null; });
     stream.on('data', (chunk) => {
       if (this.disposed) return; // never emit lines after dispose (index removed / reloaded)
@@ -147,8 +170,22 @@ export class FileTailer implements Tailer {
       const parts = buf.split(/\r?\n/);
       buf = parts.pop() ?? '';
       if (this.skipFirstPartial && parts.length) { parts.shift(); this.skipFirstPartial = false; }
-      for (const l of parts) if (l.length) lines.push(l);
-      if (lines.length >= 20000) this.ev.onLines(this.file, lines.splice(0));
+      for (const l of parts) if (l.length) push(cut(l));
+      if (buf.length > max) {
+        // A line with no newline in sight: keep its head once, then drop the rest of it instead of
+        // buffering (and re-splitting) an ever-growing string.
+        if (!this.skipFirstPartial) push(cut(buf));
+        this.skipFirstPartial = true;
+        buf = '';
+      }
+      if (lines.length >= BATCH_LINES || chars >= BATCH_CHARS) {
+        const wait = flush();
+        if (wait) {
+          stream.pause();
+          const resume = () => { if (!this.disposed) stream.resume(); };
+          wait.then(resume, resume);
+        }
+      }
     });
     stream.on('error', (e) => { if (this.disposed) return; this.ev.onError(this.file, e); this.finish(); });
     stream.on('end', () => {
@@ -156,8 +193,10 @@ export class FileTailer implements Tailer {
       this.partial = buf;
       this.offset = end;
       if (startedAtZero || this.headSig === null) this.headSig = this.readSig(end);
-      if (lines.length) this.ev.onLines(this.file, lines);
-      this.finish();
+      const wait = flush();
+      if (!wait) { this.finish(); return; }
+      const done = () => { if (this.disposed) this.reading = false; else this.finish(); };
+      wait.then(done, done);
     });
   }
 

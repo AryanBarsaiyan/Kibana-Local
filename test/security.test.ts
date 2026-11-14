@@ -1,0 +1,86 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { flatten, own, parseLine } from '../src/engine/parse';
+import { LogStore } from '../src/engine/store';
+import { QueryRequest } from '../src/engine/types';
+
+const all = (q: string): QueryRequest => ({ q, indexes: [], range: { kind: 'all' } });
+const store = () => new LogStore({ maxRows: 100_000, maxBytes: 1e9 });
+
+test('__proto__ keys are stored as fields and never touch Object.prototype', () => {
+  const s = store();
+  s.ingest('i', '/a.log', [
+    '{"__proto__": {"polluted": "yes"}, "msg": "nested"}',
+    '{"__proto__": "top", "msg": "string"}',
+    '{"constructor": {"prototype": {"polluted": "yes"}}, "msg": "ctor"}',
+  ]);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, 'polluted'), false);
+
+  const flat = flatten(JSON.parse('{"__proto__": "top"}'));
+  assert.equal(Object.getPrototypeOf(flat), Object.prototype);
+  assert.equal(own(flat, '__proto__'), 'top');
+  assert.deepEqual(Object.keys(flat), ['__proto__']);
+
+  assert.equal(s.query(all('__proto__:top')).total, 1);
+  assert.equal(s.query(all('__proto__.polluted:yes')).total, 1);
+  assert.equal(s.query(all('constructor.prototype.polluted:yes')).total, 1);
+});
+
+test('inherited Object members are not fields', () => {
+  const s = store();
+  s.ingest('i', '/a.log', ['{"msg": "a"}', 'plain text line']);
+  for (const f of ['constructor', 'toString', 'hasOwnProperty', '__proto__', 'valueOf']) {
+    assert.equal(s.query(all(`${f}:*`)).total, 0, f);
+    assert.equal(s.query(all(`not ${f}:*`)).total, 2, f);
+    assert.equal(s.query({ ...all(''), filters: [{ field: f, op: 'exists', negate: false, disabled: false }] }).total, 0, f);
+  }
+  const sorted = s.query({ ...all(''), sort: [{ field: 'constructor', dir: 'asc' }] });
+  assert.equal(sorted.total, 2);
+  assert.deepEqual(s.suggest({ field: 'toString', prefix: '', indexes: [], range: { kind: 'all' } }).values, []);
+});
+
+test('pathological JSON never aborts the rest of the batch', () => {
+  const s = store();
+  const deep = '{"a":' + '['.repeat(200_000) + ']'.repeat(200_000) + '}';
+  const deepObj = '{"a":' + '{"b":'.repeat(5_000) + '1' + '}'.repeat(5_000) + '}';
+  const manyKeys = '{' + Array.from({ length: 20_000 }, (_, i) => `"k${i}":${i}`).join(',') + '}';
+  s.ingest('i', '/a.log', [
+    deep,
+    deepObj,
+    manyKeys,
+    '{"msg": "\\ud800 lone surrogate", "\\u0000key": 1}',
+    '{"msg": "not closed"',
+    '{}',
+    'x'.repeat(5_000_000),
+    '{"msg": "after"}',
+  ]);
+  assert.equal(s.size, 8);
+  assert.equal(s.query(all('msg:after')).total, 1);
+  assert.equal(s.query(all('"lone surrogate"')).total, 1);
+  // field-name autocomplete stays capped even when one line has 20k keys
+  assert.ok(s.fieldNames().length <= 2_000 + 10);
+});
+
+test('parseLine rejects non-object JSON', () => {
+  for (const l of ['[1,2]', '"x"', '1', 'null', 'prefix | [1]', '{', '}']) assert.equal(parseLine(l), null, l);
+});
+
+test('hostile queries return an error instead of throwing', () => {
+  const s = store();
+  s.ingest('i', '/a.log', ['{"msg": "a"}']);
+  const cases = [
+    '('.repeat(10_000) + 'a' + ')'.repeat(10_000),
+    'not '.repeat(10_000) + 'a',
+    'a:('.repeat(500),
+    'x'.repeat(20_000),
+    '"unclosed',
+    'msg:"\\',
+  ];
+  for (const q of cases) {
+    const r = s.query(all(q));
+    assert.ok(r.error, `expected an error for ${q.slice(0, 30)}…`);
+  }
+  // wildcard runs are collapsed and still match
+  assert.equal(s.query(all('msg:a**********')).total, 1);
+});

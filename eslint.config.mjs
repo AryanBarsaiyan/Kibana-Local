@@ -17,11 +17,15 @@ export default tseslint.config(
     },
   },
   {
-    files: ['media/**/*.js'],
+    files: ['webview/**/*.js'],
     languageOptions: {
-      sourceType: 'script',
+      sourceType: 'module',
       globals: { acquireVsCodeApi: 'readonly', window: 'readonly', document: 'readonly', requestAnimationFrame: 'readonly',
         ResizeObserver: 'readonly', CSS: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly' },
+    },
+    rules: {
+      'no-undef': 'error',
+      'no-unused-vars': ['error', { args: 'none' }],
     },
   },
 );

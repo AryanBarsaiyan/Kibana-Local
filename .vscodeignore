@@ -1,5 +1,6 @@
 node_modules/**
 src/**
+webview/**
 test/**
 out-test/**
 .github/**
@@ -13,3 +14,5 @@ dist/**/*.map
 .vscode/**
 samples/**
 graphify-out/**
+CLAUDE.md
+.claude/**

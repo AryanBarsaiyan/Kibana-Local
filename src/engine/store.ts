@@ -1,5 +1,5 @@
 import * as path from 'path';
-import { detectFields, flatten, parseLine, parseTimestamp } from './parse';
+import { detectFields, flatten, own, parseLine, parseTimestamp } from './parse';
 import { compileFilters, compileQuery, filterHighlights, getField, Pred, QueryContext, QueryError } from './query';
 import { EvictionOrder, RowBuffer } from './ring';
 import {
@@ -16,6 +16,15 @@ const CONTINUATION = /^(\s|at\s|Caused by|\.\.\.|CallStack)/;
  */
 const EXCEPTION_HEADER = /^(?:Exception in thread "|(?:[a-z_$][\w$]*\.)+[A-Z][\w$]*(?:Exception|Error|Throwable)(?::|\s*$))/;
 const DETECT_SAMPLES = 300;
+/** field names remembered per index for autocomplete */
+const MAX_FIELD_NAMES = 2000;
+/** rows scanned between checks of the cancellation callback */
+const CANCEL_CHECK_EVERY = 4096;
+
+/** Thrown by query()/tick() when the caller's cancellation callback reports a newer request. */
+export class Cancelled extends Error {
+  constructor() { super('cancelled'); }
+}
 const STATS_SAMPLE = 10000;
 /** rows scanned (newest first) for value suggestions */
 const SUGGEST_SAMPLE = 50000;
@@ -170,7 +179,7 @@ export class LogStore {
   private recomputeTs(index: string) {
     const f = this.detectedFor(index).ts;
     this.buf.forEach((r) => {
-      if (r.index === index && r.isJson) r.ts = f ? parseTimestamp(r.flat[f]) : null;
+      if (r.index === index && r.isJson) r.ts = f ? parseTimestamp(own(r.flat, f)) : null;
     });
   }
 
@@ -180,61 +189,77 @@ export class LogStore {
     const st = this.state(index);
     const arrival = Date.now();
     for (const line of lines) {
-      const obj = parseLine(line);
-      if (obj) {
-        const flat = flatten(obj);
-        this.noteNames(index, flat);
-        if (!st.locked) {
-          st.samples.push(flat);
-          const n = st.samples.length;
-          if (n < 25 || n % 25 === 0) {
-            const before = st.detected.ts;
-            st.detected = detectFields(st.samples, this.overrides);
-            if (before !== st.detected.ts) { this.recomputeTs(index); this.dirty = true; }
-          }
-          if (n >= DETECT_SAMPLES) st.locked = true;
-        }
-        const tsf = st.detected.ts;
-        const lower = valuesText(flat);
-        const row: Row = {
-          id: this.nextId++, index, file, fileKey,
-          ts: tsf ? parseTimestamp(flat[tsf]) : null,
-          flat, raw: line, lower, isJson: true, bytes: estimateBytes(line, lower, flat), arrival,
-        };
-        this.add(row);
-        continue;
+      try {
+        this.ingestLine(index, file, fileKey, st, arrival, line);
+      } catch {
+        // One malformed line (e.g. a value too deep to stringify) must not drop the rest of the batch.
+        this.addPlain(index, file, fileKey, arrival, line);
       }
-      // Non-JSON: continuation lines (stack traces) attach to the previous entry of the same file.
-      const prev = this.lastByFile.get(fileKey);
-      if (prev && (CONTINUATION.test(line) || EXCEPTION_HEADER.test(line)) && prev.raw.length < 200_000) {
-        prev.raw += '\n' + line;
-        prev.lower += line.toLowerCase() + '\n';
-        const c = prev.flat['_continuation'];
-        prev.flat['_continuation'] = (typeof c === 'string' && c ? c + '\n' : '') + line;
-        const extra = line.length * 3 + 8;
-        prev.bytes += extra;
-        this.bytes += extra;
-        this.touched.add(prev);
-        continue;
-      }
-      const m = LEADING_TS.exec(line);
-      const flat = { message: line };
-      this.noteNames(index, flat);
-      const lower = line.toLowerCase() + '\n';
-      this.add({
-        id: this.nextId++, index, file, fileKey,
-        ts: m ? parseTimestamp(m[1]) : null,
-        flat, raw: line, lower, isJson: false, bytes: estimateBytes(line, lower, flat), arrival,
-      });
     }
     this.enforce();
+  }
+
+  private ingestLine(index: string, file: string, fileKey: string, st: IndexState, arrival: number, line: string) {
+    const obj = parseLine(line);
+    if (obj) {
+      const flat = flatten(obj);
+      this.noteNames(index, flat);
+      if (!st.locked) {
+        st.samples.push(flat);
+        const n = st.samples.length;
+        if (n < 25 || n % 25 === 0) {
+          const before = st.detected.ts;
+          st.detected = detectFields(st.samples, this.overrides);
+          if (before !== st.detected.ts) { this.recomputeTs(index); this.dirty = true; }
+        }
+        if (n >= DETECT_SAMPLES) st.locked = true;
+      }
+      const tsf = st.detected.ts;
+      const lower = valuesText(flat);
+      const row: Row = {
+        id: this.nextId++, index, file, fileKey,
+        ts: tsf ? parseTimestamp(own(flat, tsf)) : null,
+        flat, raw: line, lower, isJson: true, bytes: estimateBytes(line, lower, flat), arrival,
+      };
+      this.add(row);
+      return;
+    }
+    // Non-JSON: continuation lines (stack traces) attach to the previous entry of the same file.
+    const prev = this.lastByFile.get(fileKey);
+    if (prev && (CONTINUATION.test(line) || EXCEPTION_HEADER.test(line)) && prev.raw.length < 200_000) {
+      prev.raw += '\n' + line;
+      prev.lower += line.toLowerCase() + '\n';
+      const c = own(prev.flat, '_continuation');
+      prev.flat['_continuation'] = (typeof c === 'string' && c ? c + '\n' : '') + line;
+      const extra = line.length * 3 + 8;
+      prev.bytes += extra;
+      this.bytes += extra;
+      this.touched.add(prev);
+      return;
+    }
+    this.addPlain(index, file, fileKey, arrival, line);
+  }
+
+  /** a non-JSON line: the whole line is the message */
+  private addPlain(index: string, file: string, fileKey: string, arrival: number, line: string) {
+    const m = LEADING_TS.exec(line);
+    const flat: Record<string, Primitive> = { message: line };
+    this.noteNames(index, flat);
+    const lower = line.toLowerCase() + '\n';
+    this.add({
+      id: this.nextId++, index, file, fileKey,
+      ts: m ? parseTimestamp(m[1]) : null,
+      flat, raw: line, lower, isJson: false, bytes: estimateBytes(line, lower, flat), arrival,
+    });
   }
 
   private noteNames(index: string, flat: Record<string, Primitive>) {
     let set = this.names.get(index);
     if (!set) { set = new Set(); this.names.set(index, set); }
-    if (set.size >= 2000) return;
-    for (const k in flat) set.add(k);
+    for (const k in flat) {
+      if (set.size >= MAX_FIELD_NAMES) return;
+      set.add(k);
+    }
   }
 
   /** field names across the given indexes (all when empty), sorted */
@@ -332,8 +357,8 @@ export class LogStore {
   private sortGetter(field: string): (r: Row) => Primitive | undefined {
     const ctx = this.qctx();
     if (field === '@timestamp') return (r) => r.ts;
-    if (field === '_level') return (r) => { const f = this.detectedFor(r.index).level; return f ? r.flat[f] : undefined; };
-    if (field === '_message') return (r) => { const f = this.detectedFor(r.index).msg; return f ? r.flat[f] : undefined; };
+    if (field === '_level') return (r) => { const f = this.detectedFor(r.index).level; return f ? own(r.flat, f) : undefined; };
+    if (field === '_message') return (r) => { const f = this.detectedFor(r.index).msg; return f ? own(r.flat, f) : undefined; };
     return (r) => (field === this.detectedFor(r.index).ts ? r.ts : getField(r, field, ctx));
   }
 
@@ -375,8 +400,12 @@ export class LogStore {
     return rows;
   }
 
-  /** Full query: scans every retained row and starts a new session. */
-  query(req: QueryRequest, now = Date.now()): QueryResult {
+  /**
+   * Full query: scans every retained row and starts a new session.
+   * @param cancelled polled during the scan and sort; when it returns true the query stops with
+   *   {@link Cancelled} and the previous session is left untouched.
+   */
+  query(req: QueryRequest, now = Date.now(), cancelled?: () => boolean): QueryResult {
     const t0 = Date.now();
     let pred: Pred;
     const highlight: HighlightTerm[] = [];
@@ -390,9 +419,15 @@ export class LogStore {
     }
     const b = this.bounds(req, now);
     const matched: Row[] = [];
-    this.buf.forEach((r) => { if (this.accepts(r, b, pred)) matched.push(r); });
+    let seen = 0;
+    this.buf.forEach((r) => {
+      if (cancelled && ++seen % CANCEL_CHECK_EVERY === 0 && cancelled()) throw new Cancelled();
+      if (this.accepts(r, b, pred)) matched.push(r);
+    });
+    if (cancelled?.()) throw new Cancelled();
     const sort = (req.sort ?? []).filter((k) => k && typeof k.field === 'string' && k.field && k.field !== '_source');
     this.sortRows(matched, sort);
+    if (cancelled?.()) throw new Cancelled();
     this.session = { req, pred, matched, cmp: this.makeCmp(sort), timeDesc: isDefaultSort(sort), highlight: dedupeTerms(highlight) };
     this.pendingNew = [];
     this.touched.clear();
@@ -410,10 +445,10 @@ export class LogStore {
    * Incremental update: only rows that arrived since the last query/tick are tested.
    * Falls back to a full query when detection changed or files were dropped.
    */
-  tick(now = Date.now()): QueryResult | null {
+  tick(now = Date.now(), cancelled?: () => boolean): QueryResult | null {
     const s = this.session;
     if (!s) { this.pendingNew = []; this.touched.clear(); this.evicted = false; return null; }
-    if (this.dirty) return this.query(s.req, now);
+    if (this.dirty) return this.query(s.req, now, cancelled);
     if (!this.hasPending()) return null;
     const t0 = Date.now();
     const b = this.bounds(s.req, now);

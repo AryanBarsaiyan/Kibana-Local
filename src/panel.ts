@@ -3,8 +3,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { FileTailer, FolderTailer, LOG_EXT, Tailer, TailerEvents } from './engine/tailer';
-import { DetectedFields, Filter, IndexSource, PAGE_SIZE, Primitive, QueryRequest, QueryResult, SortSpec, StoreLimits } from './engine/types';
+import { DetectedFields, Filter, IndexSource, PAGE_SIZE, QueryRequest, QueryResult, SortSpec, StoreLimits } from './engine/types';
 import { WorkerClient } from './engine/workerClient';
+import { cleanColumns, cleanFilters, cleanIndexes, cleanRange, cleanSort, cleanText, clampInt, LIMITS } from './sanitize';
 
 type Mode = 'live' | 'interval' | 'manual';
 
@@ -18,31 +19,7 @@ interface UiState {
   sort: SortSpec[];
 }
 
-const FILTER_OPS = new Set<Filter['op']>(['is', 'is_one_of', 'between', 'exists', 'query']);
-const isPrim = (v: unknown): v is Primitive => v === null || ['string', 'number', 'boolean'].includes(typeof v);
-
-/** Webview input is untrusted: keep only well-formed filters. */
-function cleanFilters(x: unknown): Filter[] {
-  if (!Array.isArray(x)) return [];
-  const out: Filter[] = [];
-  for (const f of x.slice(0, 100)) {
-    if (!f || typeof f !== 'object' || !FILTER_OPS.has(f.op)) continue;
-    const c: Filter = { field: String(f.field ?? ''), op: f.op, negate: !!f.negate, disabled: !!f.disabled };
-    if (typeof f.label === 'string' && f.label.trim()) c.label = f.label.trim();
-    if (f.op === 'is') c.value = isPrim(f.value) ? f.value : String(f.value ?? '');
-    if (f.op === 'is_one_of') c.values = Array.isArray(f.values) ? f.values.filter(isPrim).slice(0, 200) : [];
-    if (f.op === 'between') { c.gte = String(f.gte ?? ''); c.lte = String(f.lte ?? ''); }
-    if (f.op === 'query') c.query = String(f.query ?? '');
-    out.push(c);
-  }
-  return out;
-}
-
-function cleanSort(x: unknown): SortSpec[] {
-  if (!Array.isArray(x)) return [];
-  return x.filter((k) => k && typeof k.field === 'string' && k.field && (k.dir === 'asc' || k.dir === 'desc'))
-    .slice(0, 5).map((k) => ({ field: k.field, dir: k.dir }));
-}
+const isMode = (m: unknown): m is Mode => m === 'live' || m === 'interval' || m === 'manual';
 
 const STATE_KEY = 'logscope.state';
 const HISTORY_KEY = 'logscope.history';
@@ -100,11 +77,11 @@ function cfg() {
   };
 }
 
-export class LogScopePanel {
-  static current: LogScopePanel | undefined;
+export class KibanaLocalPanel {
+  static current: KibanaLocalPanel | undefined;
   private static readonly sourcesChanged = new vscode.EventEmitter<void>();
   /** fires after the saved index list changes (used by the sidebar) */
-  static readonly onDidChangeSources = LogScopePanel.sourcesChanged.event;
+  static readonly onDidChangeSources = KibanaLocalPanel.sourcesChanged.event;
 
   private panel: vscode.WebviewPanel;
   private engine: WorkerClient;
@@ -129,12 +106,12 @@ export class LogScopePanel {
   private disposables: vscode.Disposable[] = [];
 
   static show(ctx: vscode.ExtensionContext) {
-    if (LogScopePanel.current) {
-      LogScopePanel.current.panel.reveal();
-      return LogScopePanel.current;
+    if (KibanaLocalPanel.current) {
+      KibanaLocalPanel.current.panel.reveal();
+      return KibanaLocalPanel.current;
     }
-    LogScopePanel.current = new LogScopePanel(ctx);
-    return LogScopePanel.current;
+    KibanaLocalPanel.current = new KibanaLocalPanel(ctx);
+    return KibanaLocalPanel.current;
   }
 
   private constructor(private ctx: vscode.ExtensionContext) {
@@ -142,19 +119,24 @@ export class LogScopePanel {
     this.engine.onError = (msg) => this.toast(`Engine error: ${msg.split('\n')[0]}`, 'error');
 
     this.sources = ctx.workspaceState.get<IndexSource[]>(INDEX_KEY, []);
+    // persisted state is re-validated too: it may come from an older version or a hand-edited store
+    const saved = ctx.workspaceState.get<Record<string, unknown>>(STATE_KEY, {}) ?? {};
     this.ui = {
-      q: '', indexes: [], range: { kind: 'all' }, columns: null, mode: 'live', filters: [], sort: [],
-      ...ctx.workspaceState.get<Partial<UiState>>(STATE_KEY, {}),
+      q: cleanText(saved.q),
+      indexes: cleanIndexes(saved.indexes, this.sources.map((s) => s.name)),
+      range: cleanRange(saved.range),
+      columns: cleanColumns(saved.columns),
+      mode: isMode(saved.mode) ? saved.mode : 'live',
+      filters: cleanFilters(saved.filters),
+      sort: cleanSort(saved.sort),
     };
-    this.history = ctx.workspaceState.get<string[]>(HISTORY_KEY, []).filter((x) => typeof x === 'string').slice(0, HISTORY_MAX);
-    this.ui.filters = cleanFilters(this.ui.filters);
-    this.ui.sort = cleanSort(this.ui.sort);
-    this.ui.indexes = this.ui.indexes.filter((n) => this.sources.some((s) => s.name === n));
+    const hist = ctx.workspaceState.get<unknown>(HISTORY_KEY, []);
+    this.history = (Array.isArray(hist) ? hist : []).filter((x): x is string => typeof x === 'string').map(cleanText).slice(0, HISTORY_MAX);
 
     this.panel = vscode.window.createWebviewPanel('logscope', 'KibanaLocal', vscode.ViewColumn.Active, {
       enableScripts: true,
       retainContextWhenHidden: true,
-      localResourceRoots: [vscode.Uri.joinPath(ctx.extensionUri, 'media')],
+      localResourceRoots: [vscode.Uri.joinPath(ctx.extensionUri, 'media'), vscode.Uri.joinPath(ctx.extensionUri, 'dist')],
     });
     this.panel.iconPath = vscode.Uri.joinPath(ctx.extensionUri, 'media', 'icon.png');
     this.panel.webview.html = this.html();
@@ -231,13 +213,13 @@ export class LogScopePanel {
 
   /** Remove a saved index when the panel is not open (sidebar). */
   static async removeSaved(ctx: vscode.ExtensionContext, name: string) {
-    if (LogScopePanel.current) { LogScopePanel.current.removeSource(name); return; }
+    if (KibanaLocalPanel.current) { KibanaLocalPanel.current.removeSource(name); return; }
     const sources = ctx.workspaceState.get<IndexSource[]>(INDEX_KEY, []).filter((s) => s.name !== name);
     const ui = ctx.workspaceState.get<Partial<UiState>>(STATE_KEY, {});
     if (Array.isArray(ui.indexes)) ui.indexes = ui.indexes.filter((n) => n !== name);
     await ctx.workspaceState.update(STATE_KEY, ui);
     await ctx.workspaceState.update(INDEX_KEY, sources);
-    LogScopePanel.sourcesChanged.fire();
+    KibanaLocalPanel.sourcesChanged.fire();
   }
 
   removeSource(name: string) {
@@ -258,9 +240,10 @@ export class LogScopePanel {
   private startTailer(src: IndexSource) {
     const ev: TailerEvents = {
       onLines: (file, lines) => {
-        this.engine.ingest(src.name, file, lines);
+        const ready = this.engine.ingest(src.name, file, lines);
         this.pendingLines += lines.length;
         this.onNewData();
+        return ready; // the tailer waits for this before reading more (backpressure)
       },
       onTruncate: (file) => {
         this.engine.dropFile(src.name, file);
@@ -310,12 +293,19 @@ export class LogScopePanel {
     return p;
   }
 
+  /**
+   * A new query supersedes everything before it: a query or tick still waiting in the chain is
+   * skipped, and one already running in the worker stops mid-scan (see WorkerClient.supersede).
+   */
   private runQuery() {
     if (!this.ready) return;
     const req: QueryRequest = { q: this.ui.q, indexes: this.ui.indexes, range: this.ui.range, filters: this.ui.filters, sort: this.ui.sort };
+    const gen = this.engine.supersede();
     void this.enqueue(async () => {
+      if (gen !== this.engine.generation) return;
       try {
-        const r = await this.engine.query(req);
+        const r = await this.engine.query(req, gen);
+        if (!r || gen !== this.engine.generation) return;
         this.pendingLines = 0;
         this.sendResult(r);
       } catch (e) {
@@ -327,10 +317,13 @@ export class LogScopePanel {
   private tick() {
     if (!this.ready || this.tickQueued) return;
     this.tickQueued = true;
+    const gen = this.engine.generation;
     void this.enqueue(async () => {
       this.tickQueued = false;
+      if (gen !== this.engine.generation) return; // a newer query already covers these lines
       try {
-        const r = await this.engine.tick();
+        const r = await this.engine.tick(gen);
+        if (gen !== this.engine.generation) return;
         this.pendingLines = 0;
         if (r) this.sendResult(r);
         else this.post({ type: 'pending', count: 0 });
@@ -366,7 +359,7 @@ export class LogScopePanel {
   }
 
   private persist() {
-    void this.ctx.workspaceState.update(INDEX_KEY, this.sources).then(() => LogScopePanel.sourcesChanged.fire());
+    void this.ctx.workspaceState.update(INDEX_KEY, this.sources).then(() => KibanaLocalPanel.sourcesChanged.fire());
     void this.ctx.workspaceState.update(STATE_KEY, this.ui);
   }
 
@@ -380,9 +373,9 @@ export class LogScopePanel {
         this.runQuery();
         break;
       case 'query':
-        this.ui.q = String(m.q ?? '');
-        this.ui.indexes = Array.isArray(m.indexes) ? m.indexes : [];
-        this.ui.range = m.range ?? { kind: 'all' };
+        this.ui.q = cleanText(m.q);
+        this.ui.indexes = cleanIndexes(m.indexes, this.sources.map((s) => s.name));
+        this.ui.range = cleanRange(m.range);
         if ('filters' in m) this.ui.filters = cleanFilters(m.filters);
         if ('sort' in m) this.ui.sort = cleanSort(m.sort);
         this.remember(this.ui.q);
@@ -391,7 +384,7 @@ export class LogScopePanel {
         this.runQuery();
         break;
       case 'page': {
-        const seq = m.seq, offset = Number(m.offset) || 0;
+        const seq = m.seq, offset = clampInt(m.offset, 0, Number.MAX_SAFE_INTEGER, 0);
         void this.enqueue(async () => {
           if (seq !== this.resultSeq) return; // a newer result superseded this request
           const hits = await this.engine.page(offset, PAGE_SIZE);
@@ -400,7 +393,7 @@ export class LogScopePanel {
         break;
       }
       case 'suggest': {
-        const req = { field: String(m.field ?? ''), prefix: String(m.prefix ?? ''), indexes: this.ui.indexes, range: this.ui.range };
+        const req = { field: cleanText(m.field).slice(0, LIMITS.name), prefix: cleanText(m.prefix), indexes: this.ui.indexes, range: this.ui.range };
         const token = m.token;
         if (!req.field) break;
         void this.enqueue(async () => {
@@ -419,9 +412,9 @@ export class LogScopePanel {
         break;
       case 'context': {
         const req = {
-          id: Number(m.id),
-          newer: Math.min(10000, Math.max(0, Number(m.newer) || 0)),
-          older: Math.min(10000, Math.max(0, Number(m.older) || 0)),
+          id: clampInt(m.id, 0, Number.MAX_SAFE_INTEGER, -1),
+          newer: clampInt(m.newer, 0, 10000, 0),
+          older: clampInt(m.older, 0, 10000, 0),
           indexes: this.ui.indexes,
           filters: this.ui.filters,
           sameFile: !!m.sameFile,
@@ -438,11 +431,11 @@ export class LogScopePanel {
         break;
       }
       case 'columns':
-        this.ui.columns = Array.isArray(m.columns) ? m.columns : null;
+        this.ui.columns = cleanColumns(m.columns);
         this.persist();
         break;
       case 'mode':
-        if (m.mode === 'live' || m.mode === 'interval' || m.mode === 'manual') this.ui.mode = m.mode;
+        if (isMode(m.mode)) this.ui.mode = m.mode;
         this.persist();
         this.applyTimers();
         this.tick();
@@ -452,7 +445,9 @@ export class LogScopePanel {
         setTimeout(() => this.tick(), 150);
         break;
       case 'addPath':
-        if (m.path) this.addSource(String(m.path).trim().replace(/^~(?=$|[\\/])/, process.env.HOME || process.env.USERPROFILE || '~'), m.name || undefined);
+        if (typeof m.path === 'string' && m.path.trim()) {
+          this.addSource(m.path.trim().replace(/^~(?=$|[\\/])/, process.env.HOME || process.env.USERPROFILE || '~'), cleanText(m.name).slice(0, LIMITS.name) || undefined);
+        }
         break;
       case 'browse': {
         const folder = m.kind === 'folder';
@@ -464,7 +459,7 @@ export class LogScopePanel {
         break;
       }
       case 'remove':
-        this.removeSource(String(m.name));
+        if (typeof m.name === 'string') this.removeSource(m.name);
         break;
       case 'copy':
         await vscode.env.clipboard.writeText(String(m.text ?? ''));
@@ -495,7 +490,7 @@ export class LogScopePanel {
   private html(): string {
     const w = this.panel.webview;
     const nonce = crypto.randomBytes(16).toString('base64');
-    const js = w.asWebviewUri(vscode.Uri.joinPath(this.ctx.extensionUri, 'media', 'main.js'));
+    const js = w.asWebviewUri(vscode.Uri.joinPath(this.ctx.extensionUri, 'dist', 'webview.js'));
     const css = w.asWebviewUri(vscode.Uri.joinPath(this.ctx.extensionUri, 'media', 'main.css'));
     return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${w.cspSource}; style-src ${w.cspSource}; script-src 'nonce-${nonce}';">
@@ -505,7 +500,7 @@ export class LogScopePanel {
   }
 
   dispose() {
-    LogScopePanel.current = undefined;
+    KibanaLocalPanel.current = undefined;
     for (const t of [this.liveTimer]) if (t) clearTimeout(t);
     for (const t of [this.intervalTimer, this.pollTimer]) if (t) clearInterval(t);
     for (const t of this.tailers.values()) t.dispose();

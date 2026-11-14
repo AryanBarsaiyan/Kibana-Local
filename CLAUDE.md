@@ -4,10 +4,10 @@ Kibana-style search, histogram and field explorer for local JSON-lines (LDJSON/N
 
 ## Commands
 
-- `npm run build` / `npm run watch` — esbuild bundles `src/extension.ts` and `src/engine/worker.ts` into `dist/`
+- `npm run build` / `npm run watch` — esbuild bundles `src/extension.ts`, `src/engine/worker.ts` (Node) and `webview/main.js` (browser IIFE → `dist/webview.js`) into `dist/`
 - `npm run typecheck` — `tsc` (strict, `noUnusedLocals/Parameters`, no emit)
 - `npm run lint` — eslint
-- `npm test` — compiles `src/engine` + `test` to `out-test/` and runs `node --test` (with `--expose-gc` for memory tests)
+- `npm test` — compiles `src/engine`, `src/sanitize.ts`, `webview/lib` + `test` to `out-test/` and runs `node --test` (with `--expose-gc` for memory tests)
 - `npm run samples` / `npm run samples:live` — generate sample logs into `samples/data/` (gitignored) / append live lines for tail testing
 - `npm run package` — build the `.vsix`
 - F5 in VS Code launches the Extension Development Host (`.vscode/launch.json`)
@@ -18,9 +18,11 @@ CI (`.github/workflows/ci.yml`) runs lint → typecheck → test on ubuntu/macos
 
 Three runtimes, connected by message passing:
 
-1. **Extension host** — `src/extension.ts` (commands), `src/sidebar.ts` (Indexes tree view), `src/panel.ts` (`LogScopePanel`: the webview panel; owns sources, tailers, UI state, and a `WorkerClient`). UI state, index list and query history persist in `workspaceState`.
+1. **Extension host** — `src/extension.ts` (commands), `src/sidebar.ts` (Indexes tree view), `src/panel.ts` (`KibanaLocalPanel`: the webview panel; owns sources, tailers, UI state, and a `WorkerClient`), `src/sanitize.ts` (validation of every webview message and of restored workspace state). UI state, index list and query history persist in `workspaceState`.
 2. **Engine worker** (`worker_threads`) — `src/engine/worker.ts` hosts a `LogStore` so scanning/sorting ~200k rows never blocks the extension host. `workerClient.ts` is the promise wrapper (`reqId` → pending map). The message contract is `src/engine/protocol.ts` (`ToWorker` / `FromWorker`); change both sides together.
-3. **Webview** — `media/main.js` + `media/main.css` (plain JS, no bundler). Talks to `panel.ts` via `postMessage`; message `type`s are handled in the `switch` in `panel.ts`.
+   - **Cancellation**: a `SharedArrayBuffer` generation counter (`WorkerClient.supersede()`). Queries/ticks carry their `gen`; the panel skips queued stale ones and `LogStore.query` polls the counter mid-scan and throws `Cancelled` (worker replies `result: null`). Every new user query must go through `supersede()`.
+   - **Backpressure**: `ingest()` returns a promise; every `INGEST_WINDOW` batches it sends `sync` and callers wait for the `ack`. `TailerEvents.onLines` may return that promise and the tailer pauses its stream until it settles.
+3. **Webview** — ES modules in `webview/` bundled by esbuild to `dist/webview.js`; styles in `media/main.css`. `main.js` (entry: init + host message switch), `layout.js` (page skeleton, rendered at import — keep it the only module with import-time DOM work), `state.js` (`S`, `vscode`, `$`, shared helpers), `grid.js` (results, histogram, fields), `columns.js`, `query.js`, `autocomplete.js`, `filters.js`, `context.js`, `settings.js`. Pure logic lives in typed `webview/lib/*.ts` (format, highlight, kql, grid) and is unit-tested in `test/webview.test.ts`. Talks to `panel.ts` via `postMessage`; message `type`s are handled in the `switch` in `panel.ts`.
 
 Engine modules (`src/engine/`, pure Node, no `vscode` import — keep it that way so tests run without VS Code):
 - `types.ts` — shared types (`Row`, `Filter`, `QueryRequest/Result`, `StoreLimits`, `PAGE_SIZE`)
@@ -32,8 +34,9 @@ Engine modules (`src/engine/`, pure Node, no `vscode` import — keep it that wa
 
 ## Conventions and gotchas
 
-- Webview input is untrusted: sanitize in `panel.ts` (see `cleanFilters`) before it reaches the worker.
-- Webview CSP has no `'unsafe-inline'`: never put inline `style=` in HTML strings in `main.js`; set styles via `el.style.*`.
+- Webview input is untrusted: sanitize with `src/sanitize.ts` (`cleanFilters`, `cleanRange`, `cleanIndexes`, …) in `panel.ts` before it reaches the worker; add a case to `test/sanitize.test.ts` for new message fields.
+- Log lines are untrusted too: flattened rows are plain objects, but a `__proto__` key is stored as an own property (`setField`). Read row fields with `own(flat, key)` (engine `parse.ts`, webview `lib/format.ts`), never `flat[key]`, so `constructor`/`toString` never resolve to `Object.prototype`. Tailers cut lines at `MAX_LINE_CHARS`.
+- Webview CSP has no `'unsafe-inline'`: never put inline `style=` in HTML strings in `webview/`; set styles via `el.style.*`.
 - Rows carry `fileKey = index + '\0' + fullPath`; use it (not `file`, which is a display basename) to identify sources.
 - Settings live under `logscope.*` in `package.json` `contributes.configuration`; new settings must be read in `panel.ts` and passed to the worker as `StoreLimits` / field overrides.
 - Update `changelog.md` for user-visible changes.

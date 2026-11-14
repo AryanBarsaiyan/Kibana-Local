@@ -2,6 +2,12 @@
 # Changelog
 
 ## Unreleased
+- **Faster typing in the search box on big indexes**: a new search now cancels the one still running in the worker (it stops mid-scan) and skips queued refreshes, so only the latest query does any work.
+- **Large initial loads no longer flood the engine**: file reading pauses while the worker catches up, so memory stays flat when an index starts with hundreds of MB.
+- **Very long lines** (over 1M characters, or a line still being written with no newline) are cut with `…[line truncated]` instead of being buffered whole.
+- Hardened against hostile log content: fields named `__proto__`, `constructor`, `toString` etc. are ordinary fields (previously `constructor:*` matched every line, and a `__proto__` field was silently dropped); deeply nested or unserializable JSON no longer aborts the rest of a batch; a single line with thousands of keys no longer bloats field autocomplete; queries nested too deeply or longer than 10,000 characters report an error.
+- Messages from the panel UI are validated more strictly (time range, index names, columns, numbers and text lengths).
+- The packaged extension no longer includes development files (`CLAUDE.md`, `.claude/`).
 - **Autocomplete** for the search box, like Kibana's KQL bar: suggests field names, operators (comparisons first for numeric and time fields), values with counts, `and` / `or` / `not`, `)` inside value groups, and recent queries (saved per workspace, with "clear recent"). Values come from the worker: the newest 50k lines of the selected indexes within the time range, prefix matches before substring matches; time fields suggest minutes in query format. Typing `:` after an accepted `field ` joins it to the field. The filter editor's Value box suggests values as well.
 - **Search-term highlighting** in result cells and the expanded document (Table and JSON): free text and phrases anywhere, `field:value` terms only in that field, wildcards, and the values of enabled filter pills. Negated terms are not highlighted.
 - **Filter pills**: ⊕ / ⊖ / ∃ now add Kibana-style filters to a filter bar instead of rewriting the search query. Each pill can be edited, excluded/included or temporarily disabled; a ☰ menu acts on all of them. **+ Add filter** offers *is*, *is not*, *is one of*, *is between*, *exists*, *does not exist* and custom KQL, with an optional label. Filters match exact values (case-insensitive) and are saved per workspace.

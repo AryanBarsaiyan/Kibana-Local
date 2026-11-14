@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { IndexSource } from './engine/types';
-import { INDEX_KEY, LogScopePanel } from './panel';
+import { INDEX_KEY, KibanaLocalPanel } from './panel';
 
 /** Activity-bar view: lists saved indexes; welcome content shows when there are none. */
 export class IndexesView implements vscode.TreeDataProvider<IndexSource> {
@@ -8,7 +8,7 @@ export class IndexesView implements vscode.TreeDataProvider<IndexSource> {
   readonly onDidChangeTreeData = this.changed.event;
 
   constructor(private ctx: vscode.ExtensionContext) {
-    ctx.subscriptions.push(this.changed, LogScopePanel.onDidChangeSources(() => this.changed.fire()));
+    ctx.subscriptions.push(this.changed, KibanaLocalPanel.onDidChangeSources(() => this.changed.fire()));
   }
 
   getChildren(): IndexSource[] {

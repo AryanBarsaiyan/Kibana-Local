@@ -11,7 +11,7 @@
  *   a and b, a or b, not a, (a or b) and c, implicit AND between terms
  */
 import { Filter, HighlightTerm, Primitive, Row } from './types';
-import { parseTimestamp } from './parse';
+import { own, parseTimestamp } from './parse';
 
 type Tok =
   | { t: 'word'; v: string }
@@ -24,7 +24,13 @@ export type Pred = (r: Row) => boolean;
 
 export class QueryError extends Error {}
 
+/** Deeper nesting than this is rejected instead of overflowing the parser's stack. */
+export const MAX_QUERY_DEPTH = 64;
+/** Longer queries are rejected; nothing legitimate comes close. */
+export const MAX_QUERY_LENGTH = 10_000;
+
 function tokenize(src: string): Tok[] {
+  if (src.length > MAX_QUERY_LENGTH) throw new QueryError(`Query is too long (max ${MAX_QUERY_LENGTH.toLocaleString('en')} characters)`);
   const out: Tok[] = [];
   let i = 0;
   while (i < src.length) {
@@ -60,7 +66,8 @@ const FIELD_RE = /^[A-Za-z_@][\w.@-]*$/;
 
 function escapeRe(s: string) { return s.replace(/[.+?^${}()|[\]\\]/g, '\\$&'); }
 function wildcardRe(v: string, anchored: boolean): RegExp {
-  const body = v.split('*').map(escapeRe).join('.*');
+  // "a**b" means the same as "a*b"; collapsing runs keeps the regex from backtracking needlessly
+  const body = v.replace(/\*{2,}/g, '*').split('*').map(escapeRe).join('.*');
   return new RegExp(anchored ? `^${body}$` : body, 'i');
 }
 
@@ -69,11 +76,12 @@ export interface QueryContext { tsFieldOf: (index: string) => string | null }
 export function getField(r: Row, f: string, ctx: QueryContext): Primitive | undefined {
   if (f === '_index') return r.index;
   if (f === '_file') return r.file;
-  if (f === '@timestamp' && !(f in r.flat)) {
+  const v = own(r.flat, f);
+  if (f === '@timestamp' && v === undefined) {
     const tf = ctx.tsFieldOf(r.index);
-    return tf ? r.flat[tf] : undefined;
+    return tf ? own(r.flat, tf) : undefined;
   }
-  return r.flat[f];
+  return v;
 }
 
 function valueMatcher(raw: string, quoted: boolean): (v: Primitive | undefined) => boolean {
@@ -122,6 +130,8 @@ export function compileQuery(src: string, ctx: QueryContext, collect?: Highlight
   const toks = tokenize(src);
   let p = 0;
   let neg = 0;
+  let depth = 0;
+  const enter = () => { if (++depth > MAX_QUERY_DEPTH) throw new QueryError(`Query is nested too deeply (max ${MAX_QUERY_DEPTH} levels)`); };
   const hl = (field: string | null, value: string, mode: HighlightTerm['mode']) => {
     if (collect && neg % 2 === 0 && value !== '' && field !== '@timestamp') collect.push({ field, value, mode });
   };
@@ -144,7 +154,7 @@ export function compileQuery(src: string, ctx: QueryContext, collect?: Highlight
     return parts.length === 1 ? parts[0] : (r) => parts.every((f) => f(r));
   }
   function parseNot(): Pred {
-    if (isKw(peek(), 'not')) { p++; neg++; const inner = parseNot(); neg--; return (r) => !inner(r); }
+    if (isKw(peek(), 'not')) { p++; neg++; enter(); const inner = parseNot(); depth--; neg--; return (r) => !inner(r); }
     return parsePrimary();
   }
   function parseValueGroup(field: string): Pred {
@@ -185,9 +195,11 @@ export function compileQuery(src: string, ctx: QueryContext, collect?: Highlight
     const tk = toks[p++];
     if (!tk) throw new QueryError('Unexpected end of query');
     if (tk.t === '(') {
+      enter();
       const inner = parseOr();
       if (!peek() || peek().t !== ')') throw new QueryError('Missing )');
       p++;
+      depth--;
       return inner;
     }
     if (tk.t === ')') throw new QueryError('Unexpected )');

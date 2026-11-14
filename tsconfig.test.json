@@ -1,1 +1,1 @@
-{ "extends": "./tsconfig.json", "compilerOptions": { "noEmit": false, "outDir": "out-test", "rootDir": "." }, "include": ["src/engine", "test"] }
+{ "extends": "./tsconfig.json", "compilerOptions": { "noEmit": false, "outDir": "out-test", "rootDir": "." }, "include": ["src/engine", "src/sanitize.ts", "webview/lib", "test"] }
